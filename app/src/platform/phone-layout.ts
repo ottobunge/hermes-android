@@ -1,2 +1,80 @@
-// Android adaptation layer — phone (<768px) layout rules. Filled in below.
-export function installPhoneLayout(): void {}
+// Android adaptation layer — phone (<768px) presentation.
+//
+// Upstream already does the structural work below 640px
+// (SIDEBAR_COLLAPSE_MEDIA_QUERY): rails leave the grid and the titlebar
+// toggle slides them in as an overlay drawer (NarrowOverlays), the transcript
+// takes the full width and the composer stays docked. This layer only fixes
+// what breaks on a touch phone:
+//
+//   1. the drawer starts under the titlebar band instead of under its toggle;
+//   2. the "HERMES AGENT" wordmark may shrink below its 2.75rem floor rather
+//      than clip;
+//   3. the statusbar scrolls sideways instead of clipping;
+//   4. the drawer closes on a tap outside it, or when a tap inside navigates
+//      (the hover-out dismissal never fires on touch).
+//
+// Everything is gated on max-width 767.98px, so tablet (>=768px) is untouched.
+// Only leaf modules are imported: this runs before the renderer evaluates.
+
+import { SIDEBAR_COLLAPSE_MEDIA_QUERY } from '@/app/layout-constants'
+import { TITLEBAR_HEIGHT } from '@/app/shell/titlebar'
+import { PANE_TOGGLE_REVEAL_EVENT } from '@/components/pane-shell'
+
+// store/layout.ts CHAT_SIDEBAR_PANE_ID / FILE_BROWSER_PANE_ID — not imported
+// so the layout stores don't evaluate before the bridge is installed.
+const EDGE_PANE_IDS = ['chat-sidebar', 'file-browser']
+
+const PHONE_CSS = `
+@media (max-width: 767.98px) {
+  [data-narrow-overlay] { top: ${TITLEBAR_HEIGHT / 16}rem; }
+  .wordmark { --fit-min: 1.5rem !important; }
+  [data-slot='statusbar'] > div { overflow-x: auto; scrollbar-width: none; }
+}
+`
+
+function closeDrawer(overlay: Element) {
+  const tabs = [...overlay.querySelectorAll('[data-narrow-overlay-tab]')].map(tab =>
+    tab.getAttribute('data-narrow-overlay-tab')
+  )
+
+  // `close` only closes the pane that is actually revealed, so naming every
+  // candidate is safe.
+  for (const id of new Set([...tabs, ...EDGE_PANE_IDS])) {
+    window.dispatchEvent(new CustomEvent(PANE_TOGGLE_REVEAL_EVENT, { detail: { id, mode: 'close' } }))
+  }
+}
+
+function onPointerDown(event: PointerEvent) {
+  const overlay = document.querySelector('[data-narrow-overlay]')
+  const target = event.target as Element | null
+
+  if (!overlay || !target || !window.matchMedia(SIDEBAR_COLLAPSE_MEDIA_QUERY).matches) {
+    return
+  }
+
+  if (overlay.contains(target)) {
+    // A tap that navigates (session row, nav item) hands the screen back.
+    const before = location.href
+    target.addEventListener('click', () => setTimeout(() => location.href !== before && closeDrawer(overlay)), {
+      once: true
+    })
+
+    return
+  }
+
+  // Outside the drawer — but not its own toggle, which already toggles, nor
+  // anything layered above it (menus, dialogs portalled to <body>).
+  if (target.closest('[data-titlebar-cluster], [role="dialog"], [role="menu"], [data-radix-popper-content-wrapper]')) {
+    return
+  }
+
+  closeDrawer(overlay)
+}
+
+export function installPhoneLayout(): void {
+  const style = document.createElement('style')
+  style.dataset.androidPhoneLayout = ''
+  style.textContent = PHONE_CSS
+  document.head.appendChild(style)
+  document.addEventListener('pointerdown', onPointerDown, true)
+}

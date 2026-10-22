@@ -94,9 +94,33 @@ const phone = await browser.newContext({ viewport: { width: 390, height: 844 }, 
 const phonePage = await phone.newPage()
 watch(phonePage, 'phone')
 await phonePage.goto(args.app)
-await assertConnected(phonePage, 'phone')
-await phonePage.waitForTimeout(2_000)
+// Phone: the sessions sidebar is a drawer (not mounted until opened), so the
+// connected surface is the composer + the titlebar's sidebar toggle.
+await phonePage.locator('[contenteditable="true"], textarea').first().waitFor({ timeout: 45_000 })
+// A gateway with no model provider puts the first-run provider picker over
+// the app; skipping it is a user action, not a boot failure.
+const later = phonePage.getByText(/choose a provider later/i)
+const gate = phonePage.locator('.z-\\(--z-onboarding\\)')
+await later.or(phonePage.locator('body:not(:has(.z-\\(--z-onboarding\\)))')).first().waitFor({ timeout: 45_000 })
+if (await later.isVisible()) {
+  await later.tap()
+  await gate.waitFor({ state: 'detached', timeout: 15_000 })
+}
 await shot(phonePage, '4-connected-phone-390')
+
+const toggle = phonePage.getByRole('button', { name: /show sidebar|hide sidebar/i }).first()
+await toggle.tap({ timeout: 15_000 })
+await phonePage.locator('[data-narrow-overlay] [data-slot="sidebar"]').waitFor({ timeout: 15_000 })
+await phonePage.waitForTimeout(500)
+await shot(phonePage, '5-phone-drawer-open')
+
+await phonePage.touchscreen.tap(370, 400) // outside the drawer (max 85vw)
+await phonePage.locator('[data-narrow-overlay]').waitFor({ state: 'detached', timeout: 5_000 })
+
+const overflow = await phonePage.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)
+if (overflow > 0) {
+  problems.push(`[phone] page overflows the viewport by ${overflow}px`)
+}
 
 await browser.close()
 

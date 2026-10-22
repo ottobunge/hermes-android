@@ -7,7 +7,12 @@ React renderer from `upstream/apps/desktop` (v0.17.6, hermes-agent 0.21.5).
   byte-identical copy of upstream; it runs unchanged.
 - **Phone (< 768px): minimal adaptations** of the same layout, through one
   small adaptation layer (`src/platform/phone-layout.ts`) — not a forked
-  component tree. *Status: not implemented yet* (the hook is an empty stub).
+  component tree. Upstream already turns the side rails into a drawer below
+  640px (titlebar toggle → overlay, full-width transcript, docked composer);
+  the phone layer fixes what breaks on a touch phone: the drawer sits below
+  its toggle, it closes on a tap outside or when a tap inside navigates, the
+  "HERMES AGENT" wordmark shrinks instead of clipping, and the statusbar
+  scrolls sideways. All of it is gated on `max-width: 767.98px`.
 - **Remote gateway only.** Android cannot spawn the local Python agent, so the
   app is a client for a Hermes gateway running elsewhere (`hermes serve`),
   using the desktop's existing remote-connection mode.
@@ -117,8 +122,22 @@ is possible from a missing required member.
 - **No terminal, git, file browser, local file previews, pop-out windows, pet
   overlay, quick entry, find-in-page, in-app updates.**
 - **Plain-http gateways** need `allowMixedContent: true` (`capacitor.config.ts`).
-- **Phone layout not done** — `installPhoneLayout()` is an empty stub; phones
-  get the unadapted desktop layout.
+- **Phone layout covers presentation only.** Between 640 and 767px the rails
+  stay docked (upstream's collapse breakpoint is 640px, not 768px). Below
+  640px the drawer has no swipe gesture: open and close it with the titlebar
+  toggle or a tap outside. No bottom nav.
+- **Render-loop errors on every page (open, not fixed).** Each boot throws
+  4–7 uncaught `Maximum update depth exceeded. The result of getSnapshot
+  should be cached…` errors at every width. Traced in a dev build: the loop
+  is assistant-ui's thread-list store (`@assistant-ui/core`
+  `ThreadListRuntimeImpl` state via `@assistant-ui/tap`'s
+  `useSyncExternalStore`). Each commit re-notifies it and it hands back a
+  fresh object whose fields are all `===` the previous ones, so tap's
+  50-commit guard throws. The app still renders and works afterwards. The
+  `@assistant-ui/*` and React pins are identical to upstream's `package.json`
+  (upstream ships no lockfile), so this is probably upstream renderer
+  behavior, but it hasn't been checked against Electron desktop, so it's
+  unconfirmed.
 - **`app/android/` does not exist.** `npx cap add android` / `npx cap sync
   android` were not run, so the native project is not committed yet.
 - **No Android SDK/JDK on this machine** (`java`, `sdkmanager`, `adb` absent,
@@ -181,11 +200,14 @@ hermes gateway run &                       # initializes state.db (else /api/ses
   flakes or real port breakage is unknown. No tests are excluded.
 - `cap sync` / gradle — **not run** (no `android/`, no SDK).
 
-### Smoke: executed, FAILED (partial)
+### Smoke: executed, FAILED (phone step now passes)
 
-Executed against a scratch gateway (`hermes serve --port 19719` + `hermes
-gateway run`, throwaway `HERMES_HOME`, no model provider configured), built
-app on `vite preview`, headless Chromium 155. Output, verbatim:
+Round 3 rerun: scratch gateway (`hermes serve --port 19719` + `hermes gateway
+run`, throwaway `HERMES_HOME`, no model provider), built app on `vite
+preview`, headless Chromium 155. The phone step now tests the drawer: tap the
+titlebar sidebar toggle → `[data-narrow-overlay]` holds the sidebar → a tap
+outside closes it → no horizontal overflow. Output, verbatim (deduplicated
+lines collapsed as `×N`):
 
 ```
 screenshot: /tmp/smoke-out/1-onboarding.png
@@ -194,28 +216,46 @@ screenshot: /tmp/smoke-out/1-onboarding.png
 screenshot: /tmp/smoke-out/2-connected-1280.png
 screenshot: /tmp/smoke-out/3-connected-tablet-820.png
 [phone] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
-locator.waitFor: Timeout 45000ms exceeded.
-Call log:
-  - waiting for locator('[data-slot="sidebar"], [data-sidebar="sidebar"]').first()
-    at assertConnected (scripts/smoke.mjs:74:78)
-    at scripts/smoke.mjs:97:7
+screenshot: /tmp/smoke-out/4-connected-phone-390.png
+screenshot: /tmp/smoke-out/5-phone-drawer-open.png
+SMOKE FAILED:
+[onboarding] pageerror: Maximum update depth exceeded. The result of getSnapshot should be cached to avoid an infinite loop.  ×7
+[tablet] pageerror: Maximum update depth exceeded. The result of getSnapshot should be cached to avoid an infinite loop.  ×7
+[phone] pageerror: Maximum update depth exceeded. The result of getSnapshot should be cached to avoid an infinite loop.  ×6
+exit=1
 ```
 
-What that means:
+- **Onboarding → connected:** passes (URL + token through the reused Gateway
+  panel, "Save and reconnect", reload into the app).
+- **Tablet 1280 / 820:** passes the DOM check. No layout code changed at
+  ≥ 768px: the phone CSS is inside `@media (max-width: 767.98px)` and the
+  tap-to-close handler only acts while a narrow overlay exists (< 640px).
+- **Phone 390:** **passes.** The composer renders, the drawer opens from the
+  toggle and closes on a tap outside, and nothing overflows.
+- **Overall exit 1** because of the render-loop `pageerror`s (see Deviations).
+  `[onboarding]` and `[tablet]` are two listeners on the same page, so that
+  page's 7 errors appear twice. The round-2 run also hit these errors but
+  aborted before it printed them; its "no uncaught page errors" note was
+  wrong.
+- No `hermesDesktop.* is not a function` errors.
 
-1. **Onboarding — works.** Fresh profile shows "Connect to a Hermes gateway"
-   with the reused Gateway panel; URL + token filled; "Save and reconnect"
-   tested the gateway and reloaded.
-2. **Tablet (1280 / 820) — script passed, but not a real pass.** The sidebar
-   and composer elements are in the DOM, yet both screenshots show the
-   desktop's first-run overlay "Let's get you setup with Hermes Agent —
-   Starting Hermes… 100%" covering the app, not a visible chat surface. Likely
-   because the scratch gateway has no model provider; not confirmed. The
-   script's DOM-presence check is too weak to catch this.
-3. **Phone (390) — failed.** No sidebar element at phone width within 45s
-   (phone layout is unimplemented; the desktop sidebar is probably not mounted
-   at that width).
-4. A **409 Conflict** from some gateway request on every page; which request
-   is not yet identified.
-5. No `hermesDesktop.* is not a function` errors and no uncaught page errors
-   were recorded before the phone step aborted the run.
+**The 409** is `POST /api/sessions/owner-backfill`, which the renderer fires
+once per scope (`src/lib/legacy-session-owner-backfill.ts`) to stamp
+pre-ownership session rows. The gateway answers `409 {"detail":"Exclusive
+maintenance refused: Gateway runtime already owns profile …. Drain and stop
+the gateway, then retry."}` whenever `hermes gateway run` owns the profile,
+which the scratch setup needs and which most real remote gateways have.
+Electron desktop takes the same path (`hasRegistryTopology()` is true whenever
+`connections.list` exists), so this is **upstream behavior, not a port
+defect**. It is fire-and-forget, and the renderer re-arms it on the next
+session-list refresh. Not changed.
+
+**The tablet "Let's get you setup with Hermes Agent / Starting Hermes…"
+overlay** is `DesktopOnboardingOverlay` (`src/components/onboarding/index.tsx`).
+It renders until `refreshOnboarding` → `checkRuntime` resolves
+`$desktopOnboarding.configured`. It shows "Starting Hermes…" while that is
+`null` and the provider picker when it is `false`, and it hides when it is
+`true`. So the overlay is purely the scratch gateway having no model
+provider. Once loaded it showed "Hermes is not connected to any AI provider
+yet", and "I'll choose a provider later" dismisses it (the phone step does
+that).
