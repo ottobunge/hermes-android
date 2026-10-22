@@ -126,18 +126,16 @@ is possible from a missing required member.
   stay docked (upstream's collapse breakpoint is 640px, not 768px). Below
   640px the drawer has no swipe gesture: open and close it with the titlebar
   toggle or a tap outside. No bottom nav.
-- **Render-loop errors on every page (open, not fixed).** Each boot throws
-  4–7 uncaught `Maximum update depth exceeded. The result of getSnapshot
-  should be cached…` errors at every width. Traced in a dev build: the loop
-  is assistant-ui's thread-list store (`@assistant-ui/core`
-  `ThreadListRuntimeImpl` state via `@assistant-ui/tap`'s
+- **Render-loop errors on every page: confirmed upstream behavior, not a
+  port defect.** Each boot throws 4–7 uncaught `Maximum update depth exceeded.
+  The result of getSnapshot should be cached…` errors at every width. Traced
+  in a dev build: the loop is assistant-ui's thread-list store
+  (`@assistant-ui/core` `ThreadListRuntimeImpl` state via `@assistant-ui/tap`'s
   `useSyncExternalStore`). Each commit re-notifies it and it hands back a
   fresh object whose fields are all `===` the previous ones, so tap's
-  50-commit guard throws. The app still renders and works afterwards. The
-  `@assistant-ui/*` and React pins are identical to upstream's `package.json`
-  (upstream ships no lockfile), so this is probably upstream renderer
-  behavior, but it hasn't been checked against Electron desktop, so it's
-  unconfirmed.
+  50-commit guard throws. The app still renders and works afterwards. See
+  "Upstream comparison" below for the Electron reproduction. The smoke keeps
+  failing on it on purpose, because it's a real error.
 - **`app/android/` does not exist.** `npx cap add android` / `npx cap sync
   android` were not run, so the native project is not committed yet.
 - **No Android SDK/JDK on this machine** (`java`, `sdkmanager`, `adb` absent,
@@ -232,7 +230,8 @@ exit=1
   tap-to-close handler only acts while a narrow overlay exists (< 640px).
 - **Phone 390:** **passes.** The composer renders, the drawer opens from the
   toggle and closes on a tap outside, and nothing overflows.
-- **Overall exit 1** because of the render-loop `pageerror`s (see Deviations).
+- **Overall exit 1** because of the render-loop `pageerror`s (upstream
+  behavior, see Deviations and "Upstream comparison").
   `[onboarding]` and `[tablet]` are two listeners on the same page, so that
   page's 7 errors appear twice. The round-2 run also hit these errors but
   aborted before it printed them; its "no uncaught page errors" note was
@@ -259,3 +258,41 @@ It renders until `refreshOnboarding` → `checkRuntime` resolves
 provider. Once loaded it showed "Hermes is not connected to any AI provider
 yet", and "I'll choose a provider later" dismisses it (the phone step does
 that).
+
+### Upstream comparison (round 4): the render loop reproduces in Electron
+
+Run on 2026-10-22: the **unmodified upstream renderer in real Electron**,
+through upstream's own preload and main process, against the same scratch
+gateway.
+
+- **Setup:**
+  - Copied `upstream/apps/{desktop,shared}` to `/tmp/updesk`; nothing under
+    `upstream/` was modified.
+  - `npm install --ignore-scripts --legacy-peer-deps`, standalone. The
+    workspace install crashes npm's arborist with `Cannot read properties of
+    null (reading 'edgesOut')`. The resolved `@assistant-ui/tap` 0.9.24, `core`
+    0.2.23, `react` 0.14.24, `store` 0.2.22 and `react` 19.2.7 match `app/`
+    exactly.
+  - Scratch-only patches:
+    - added `lucide-react@1.61.0`, which upstream gets hoisted from its
+      monorepo root;
+    - stubbed `node-pty`, whose native build was skipped (terminal only);
+    - pointed `LD_LIBRARY_PATH` at Nix-store libraries so Electron 40.10.2
+      loads on NixOS.
+  - Built Electron main (`tsc --build tsconfig.electron.json` +
+    `bundle-electron-main.mjs --dev`) and ran `vite` for the renderer.
+  - Launched with `HERMES_DESKTOP_REMOTE_URL/TOKEN` (remote mode),
+    `HERMES_DESKTOP_CDP_PORT=9333`, `--ozone-platform=headless`.
+- **Measurement:** attached Playwright over CDP, reloaded the window and
+  watched for 100s.
+  - `getConnection()` → `{"mode":"remote","baseUrl":"http://127.0.0.1:19719"}`.
+  - Same provider-setup gate as the port.
+  - **5 × `pageerror: Maximum update depth exceeded. The result of
+    getSnapshot should be cached to avoid an infinite loop.`**, the same count
+    range as the port (4–7).
+- **Conclusion:** the renderer source in `app/src` is byte-identical to
+  upstream's (`diff -rq` differs only by `src/platform/`), the dependency
+  versions are identical, and the error reproduces with upstream's own bridge.
+  So it is not caused by the Android bridge, the entry order or dependency
+  resolution. It's upstream behavior, and no port change was made.
+
