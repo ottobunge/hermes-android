@@ -29,3 +29,27 @@ export function classifyPageErrors(errors) {
 
   return { problems }
 }
+
+// console.error lines that mean the UI broke even though nothing reached
+// window.onerror: React error boundaries CATCH render errors (so no
+// pageerror) and report them via console.error("[error-boundary:<label>]", …)
+// (src/components/error-boundary.tsx), and React logs the caught error itself.
+// A boundary may auto-recover, so the DOM alone can miss it. Unrelated
+// diagnostics — e.g. "Failed to load resource … 409" — are not problems.
+const BOUNDARY_REPORT = /^\[error-boundary(?::[^\]]*)?\]/
+
+/** text of a console.error message → problem description, or null. */
+export function classifyConsoleError(text) {
+  const message = String(text)
+  const firstLine = message.split('\n')[0].slice(0, 240)
+
+  if (BOUNDARY_REPORT.test(message)) {
+    return `error boundary caught a render error: ${firstLine}`
+  }
+
+  if (/Maximum update depth exceeded/.test(message)) {
+    return `render-loop regression (patches/@assistant-ui+core+0.2.23.patch), caught and logged: ${firstLine}`
+  }
+
+  return null
+}

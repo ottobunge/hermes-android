@@ -53,3 +53,25 @@ test('every error is reported, one problem each, other errors as plain pageerror
   assert.equal(problems.length, 3)
   assert.match(problems[2], /^\[phone\] pageerror: Cannot read properties of undefined\n {4}\(no stack\)$/)
 })
+
+test('console: an error-boundary report is a problem', async () => {
+  const { classifyConsoleError } = await import('./smoke-classifier.mjs')
+  const text = `[error-boundary:contrib:workspace] Error: ${GET_SNAPSHOT}\n    at http://127.0.0.1:4174/assets/capabilities-1.js:4:1991`
+
+  assert.match(classifyConsoleError(text), /^error boundary caught a render error: \[error-boundary:contrib:workspace\]/)
+  assert.match(classifyConsoleError('[error-boundary] TypeError: x is undefined'), /error boundary caught/)
+})
+
+test('console: a caught render-loop error logged by React is a problem', async () => {
+  const { classifyConsoleError } = await import('./smoke-classifier.mjs')
+
+  assert.match(classifyConsoleError(`Error: ${GET_SNAPSHOT}\n    at …`), /render-loop regression/)
+  assert.match(classifyConsoleError(`Error: ${MARK_DIRTY}`), /render-loop regression/)
+})
+
+test('console: unrelated HTTP resource diagnostics are not problems', async () => {
+  const { classifyConsoleError } = await import('./smoke-classifier.mjs')
+
+  assert.equal(classifyConsoleError('Failed to load resource: the server responded with a status of 409 (Conflict)'), null)
+  assert.equal(classifyConsoleError('Failed to load resource: net::ERR_CONNECTION_REFUSED'), null)
+})

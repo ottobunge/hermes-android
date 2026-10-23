@@ -11,9 +11,10 @@
 //      than clip;
 //   3. the statusbar scrolls sideways instead of clipping;
 //   4. the drawer closes on a tap outside it, when a tap inside navigates, or
-//      when a tap selects a session row / nav item — even the one already
-//      showing, which doesn't change the URL (the hover-out dismissal never
-//      fires on touch);
+//      when a tap re-selects what is already showing (a nav item, or the
+//      selected session row — no URL change). Browsing controls inside the
+//      drawer (paging, project drill-in/Back, group expansion) keep it open.
+//      The hover-out dismissal never fires on touch;
 //   5. overlay views (Settings, Scheduled jobs, …) keep their titlebar-height
 //      top inset but drop the ~44px side/bottom gutters, which left a 300px
 //      card on a 390px screen;
@@ -54,8 +55,21 @@ function closeDrawer(overlay: Element) {
   }
 }
 
-// Session rows and nav items: selecting one hands the screen back.
-const SELECT_TARGETS = '[data-slot="row-button"], [data-sidebar="menu-button"]'
+// Taps that SELECT even when the URL doesn't change: a nav item (every
+// sidebar menu-button calls onNavigate), or the tap target of the row that is
+// already the selected one (session-row.tsx paints its SidebarRowShell — the
+// RowButton's direct parent — with the row-active background). Every other
+// RowButton (chrome.tsx), e.g. "Show more" (workspace-header.tsx), project
+// drill-in/Back (overview-row.tsx) or group expansion (gateway-groups.tsx),
+// is browsing: it only closes the drawer if it actually navigates.
+const NAV_ITEM = '[data-sidebar="menu-button"]'
+const SELECTED_ROW = '.bg-\\(--ui-row-active-background\\)'
+
+function selectsInPlace(target: Element): boolean {
+  const rowButton = target.closest('[data-slot="row-button"]')
+
+  return Boolean(target.closest(NAV_ITEM) || rowButton?.parentElement?.matches(SELECTED_ROW))
+}
 
 // URL when a press inside the drawer began (and whether it pressed a
 // selectable row); one delegated click handler acts after the click, so
@@ -76,7 +90,7 @@ function onPointerDown(event: PointerEvent) {
   if (overlay.contains(target)) {
     // A tap that navigates or selects a row hands the screen back.
     hrefAtPress = location.href
-    pressedRow = Boolean(target.closest(SELECT_TARGETS))
+    pressedRow = selectsInPlace(target)
 
     return
   }

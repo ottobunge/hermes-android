@@ -249,12 +249,150 @@ done
 hermes sessions list                       # then rename the two imported ids:
 hermes sessions rename <alpha-id> "Smoke alpha"
 hermes sessions rename <beta-id>  "Smoke beta"
+# the project the phone drawer-browsing check drills into (round 11)
+mkdir -p /tmp/smoke-project && hermes project create "Smoke project" /tmp/smoke-project
 ```
 
 Run `npm run build` before every smoke: a stale `dist/` serves a blank page
 (round 9).
 
 ## Verification
+
+### Round 11 (2026-10-23): drawer dismissal scope + smoke boundary coverage
+
+Gates, in this order, all exit 0 on the final build:
+
+```
+npm run typecheck                               → exit 0
+npm run build                                   → exit 0
+npx vitest run src/platform                     → exit 0
+  Test Files  2 passed (2)
+  Tests  20 passed (20)
+node --test scripts/smoke-classifier.test.mjs   → exit 0
+  ok 1 - no page errors → no problems
+  ok 2 - the formerly tolerated getSnapshot loop now fails, in every phase
+  ok 3 - a single occurrence fails — there is no count allowance
+  ok 4 - the markDirty variant (typing) fails as a render-loop regression
+  ok 5 - every error is reported, one problem each, other errors as plain pageerrors
+  ok 6 - console: an error-boundary report is a problem
+  ok 7 - console: a caught render-loop error logged by React is a problem
+  ok 8 - console: unrelated HTTP resource diagnostics are not problems
+  # tests 8
+  # pass 8
+  # fail 0
+node scripts/smoke.mjs …                        → exit 0 on 8 runs of the final code
+                                                  (5 consecutive, then 3 consecutive on the
+                                                  rebuilt final dist after the negative controls)
+```
+
+**1. Drawer dismissal no longer catches sidebar browsing controls** (a
+round-10 regression).
+- Round 10 closed the phone drawer on any `[data-slot="row-button"]` tap.
+  That attribute comes from the shared `RowButton`
+  (`src/components/ui/row-button.tsx`), which `chrome.tsx` uses for session
+  rows (`SidebarRowBody`) **and** for browsing controls: "Show more"
+  (`projects/workspace-header.tsx:86`), project drill-in and Back
+  (`projects/overview-row.tsx:180,67`; entering a project never opens a
+  session) and group expansion (`gateway-groups.tsx:272`). No session-only
+  attribute exists in that markup.
+- The discriminator is now a selection, verified against the components
+  (`src/platform/phone-layout.ts:65-93`, `selectsInPlace`). The drawer
+  closes when:
+  - the URL changed;
+  - a nav item was tapped (`[data-sidebar="menu-button"]`; every one calls
+    `onNavigate`, `sidebar/index.tsx`);
+  - the tapped RowButton's own row (its direct parent, `SidebarRowShell`) is
+    the selected one, painted `bg-(--ui-row-active-background)` by
+    `session-row.tsx:364`, i.e. re-selecting the open session.
+- Browsing controls are none of these, so the drawer stays open.
+- **Smoke** (`scripts/smoke.mjs:395-432`): a phone context with the
+  sidebar's project grouping on (the persisted
+  `hermes.desktop.agentsGroupedByWorkspace` flag) taps "Open Smoke project"
+  in the drawer, then its "All projects" back row. The drawer must stay open
+  after both, and the overview must come back. This needs the seeded "Smoke
+  project" (`hermes project create`, see "Boot smoke").
+- **Negative control:** with round 10's rule restored (`rowButton` alone
+  closes), the rebuilt app fails the smoke:
+
+```
+SMOKE FAILED:
+[phone] project drill-in ("Open Smoke project") closed the drawer — browsing must keep it open
+exit=1
+```
+
+**2. The smoke now catches boundary-caught render errors.**
+- React error boundaries catch render errors, so they never reach
+  `pageerror`. `src/components/error-boundary.tsx:53` reports them with
+  `console.error("[error-boundary:<label>]", …)`, and React logs the caught
+  error too. A boundary may also auto-recover, so the DOM check alone can
+  miss it.
+- `classifyConsoleError` (`scripts/smoke-classifier.mjs:39-55`) turns
+  boundary reports and any logged "Maximum update depth exceeded" into
+  problems, as they occur (`scripts/smoke.mjs:56`).
+- Unrelated HTTP resource diagnostics (the gateway's 409, connection
+  refusals) stay informational. The tests are `smoke-classifier.test.mjs`
+  6–8.
+- The 820px tablet phase now asserts the workspace is still alive after its
+  Settings round-trip (`smoke.mjs:252`), and the drawer-browsing context
+  ends with the same check.
+- The steps run inside `run()` (`smoke.mjs:77`), so a fatal step is
+  reported (`fatal: …`, `smoke.mjs:439`) together with everything collected
+  before it, instead of an uncaught exception that hid the earlier findings.
+- **Negative control:** with the assistant-ui patch removed, the smoke
+  reports the caught errors (deduplicated, `×N` = repeats):
+
+```
+SMOKE FAILED:
+[tablet] render-loop regression (patches/@assistant-ui+core+0.2.23.patch), caught and logged: Error: Maximum update depth exceeded. The result of getSnapshot should be ca
+[tablet] error boundary caught a render error: [error-boundary:contrib:workspace] Error: Maximum update depth exceeded. The result of getSnapshot should be cached to avoi
+[tablet] switching to "Smoke beta" did not render its transcript
+[tablet] switching to "Smoke alpha" did not render its transcript
+[tablet] an error boundary is showing ("… failed to render") — the main surface crashed
+fatal: locator.waitFor: Timeout 45000ms exceeded.
+×13 [tablet] render-loop regression (patches/@assistant-ui+core+0.2.23.patch): Maximum update depth exceeded. The result of getSnapshot should be cached to avoid an infinite 
+×13     at http://127.0.0.1:4174/assets/capabilities-B1fqOH3C.js:4:1991
+[tablet] render-loop regression (patches/@assistant-ui+core+0.2.23.patch): Maximum update depth exceeded. This can happen when a resource repeatedly calls setState inside
+    at qg.markDirty (http://127.0.0.1:4174/assets/capabilities-B1fqOH3C.js:4:3887)
+exit=1
+```
+
+**3. The "transcripts followed" line is printed only when that phase added
+no problems** (`smoke.mjs:168,206`). In the negative control above it was
+not printed: 0 occurrences.
+
+**Also: the phone composer step waits for focus.** One run typed before
+the tap's focus had landed, so the text went nowhere. The step now waits up
+to 5 s for the composer to own focus before typing, and reports `tapping
+the composer did not focus it` if it never does (`smoke.mjs:277-294`), so a
+real focus regression still fails.
+
+Final smoke run, verbatim (token redacted):
+
+```
+screenshot: /tmp/smoke-out/1-onboarding.png
+[tablet] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+[tablet] first-run overlay: provider picker after 2.2s (gateway has no model provider) → skipped
+[tablet] thread list: switched Smoke alpha → Smoke beta → Smoke alpha, transcripts followed
+screenshot: /tmp/smoke-out/2-connected-1280.png
+screenshot: /tmp/smoke-out/3-connected-tablet-820.png
+[phone] first-run overlay: none (provider configured or previously skipped)
+screenshot: /tmp/smoke-out/4-connected-phone-390.png
+[phone] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+[phone] thread list: switched Smoke alpha → Smoke beta → Smoke alpha, transcripts followed
+screenshot: /tmp/smoke-out/5-phone-drawer-open.png
+screenshot: /tmp/smoke-out/6-phone-settings.png
+screenshot: /tmp/smoke-out/7-phone-capabilities.png
+screenshot: /tmp/smoke-out/8-phone-onboarding.png
+[phone] first-run overlay: none (provider configured or previously skipped)
+[phone] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+screenshot: /tmp/smoke-out/9-phone-drawer-project.png
+[phone] drawer browsing: project drill-in and "All projects" kept the drawer open
+page errors: 0 (none tolerated)
+SMOKE OK: onboarding → connected chat surface (tablet + phone), thread-list switching works, zero page errors, zero bridge errors
+exit=0
+```
+
+### Round 10
 
 Round 10 (2026-10-23, assistant-ui render-loop fix). Gates run in this
 order, all exit 0:
@@ -359,6 +497,8 @@ that was already open didn't change the URL, so the drawer stayed open (the
 closes the drawer when a tap selects a session row
 (`[data-slot="row-button"]`) or nav item (`[data-sidebar="menu-button"]`).
 The smoke's phone sequence starts by tapping the already-open session.
+*(Round 11 narrowed this: `[data-slot="row-button"]` also covers browsing
+controls, so only the selected row counts.)*
 
 ### Earlier verification notes
 
@@ -433,14 +573,21 @@ production build on `vite preview`, headless Chromium 155. The smoke:
   - Settings opens from the titlebar with a card within 24px of the viewport
     width;
   - Capabilities opens from the drawer, which closes on that navigation;
+  - browsing inside the drawer (project drill-in, "All projects") keeps it
+    open (round 11);
   - onboarding (no gateway) has its URL field and Save on the first screen;
   - no horizontal overflow on chat, the session transcript, settings,
     capabilities and onboarding;
-- fails whenever an error boundary shows "… failed to render";
-- **fails on any uncaught page error**, via `scripts/smoke-classifier.mjs`.
+- fails whenever an error boundary catches a render error: through its
+  `console.error("[error-boundary:…]")` report as it happens, and through
+  the "… failed to render" fallback at 1280px, after the 820px Settings
+  round-trip and on phone;
+- fails on any logged "Maximum update depth exceeded", even when caught;
+- **fails on any uncaught page error**, via `scripts/smoke-classifier.mjs`;
+- reports a fatal step together with everything collected before it.
 
-Final run on the final build, verbatim (token redacted; three earlier runs
-on the same code also exited 0 with `page errors: 0`):
+Round-10 run, verbatim (token redacted; the round-11 run is in "Round 11"
+above):
 
 ```
 screenshot: /tmp/smoke-out/1-onboarding.png
