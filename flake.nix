@@ -14,8 +14,8 @@
       androidComposition = pkgs.androidenv.composeAndroidPackages {
         cmdLineToolsVersion = "13.0";
         platformToolsVersion = "37.0.1";
-        buildToolsVersions = [ "35.0.0" ];
-        platformVersions = [ "35" ];
+        buildToolsVersions = [ "35.0.0" "36.0.0" ];
+        platformVersions = [ "35" "36" ];
         includeNDK = false;
         includeEmulator = false;
       };
@@ -24,12 +24,12 @@
       devShells.${system}.default = pkgs.mkShell {
         packages = [
           androidComposition.androidsdk
-          pkgs.jdk17
+          pkgs.jdk21
           pkgs.nodejs_22
         ];
         ANDROID_HOME = "${androidComposition.androidsdk}/libexec/android-sdk";
         ANDROID_SDK_ROOT = "${androidComposition.androidsdk}/libexec/android-sdk";
-        JAVA_HOME = "${pkgs.jdk17}/lib/openjdk";
+        JAVA_HOME = "${pkgs.jdk21}/lib/openjdk";
         # Gradle's aapt2/AAPT2 daemon needs the Nix glibc loader path.
         LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath [ pkgs.zlib pkgs.ncurses5 ]}";
       };
