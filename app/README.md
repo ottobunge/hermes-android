@@ -258,6 +258,121 @@ Run `npm run build` before every smoke: a stale `dist/` serves a blank page
 
 ## Verification
 
+### Round 12 (2026-10-23): drawer dismisses on a session focus switch
+
+**What regressed (round 11, 3af0bf9).**
+- Round 11 recognized a session selection only if the URL changed or the
+  tapped row was **already** the selected row when pressed.
+- Tapping a session that is already open in another tile/tab, but not
+  focused, is neither:
+  - a plain row click resumes it (`session-row.tsx:451`) →
+    `openSession` (`contrib/wiring.tsx:1157`), which only **focuses** the
+    existing tile/tab (`open-session.ts:199`; `store/session-states.ts`);
+  - there is no route change, and at press time its row carried the
+    row-**open** background, not row-active (`session-row.tsx:185,368`).
+- So the drawer stayed open. Reproduced live at 390px, then covered by the
+  smoke. Round 10's broad rule had dismissed these.
+
+**Discriminator: the selection outcome, read after the click**
+(`src/platform/phone-layout.ts:74-145`).
+- The sidebar paints a session row's shell (the RowButton's direct parent)
+  `bg-(--ui-row-active-background)` exactly when that session is the
+  focused one (`sidebar/index.tsx` selection, `session-row.tsx:364`).
+- So the drawer now records the pressed RowButton at pointerdown (`:102`).
+  After the click it closes if any of these is true (`:134`):
+  - a nav item was tapped (`[data-sidebar="menu-button"]`, all call
+    `onNavigate`);
+  - the URL changed;
+  - **that row is the selected row once the click has settled**. It polls
+    each frame for up to 300 ms (`:78`, `:142`), because the focus change
+    commits through the session stores a few frames later.
+- This covers a routed switch, re-selecting the current session and the
+  focus-only switch.
+- Browsing controls keep the drawer open. "Show more", project drill-in /
+  "All projects" and group expansion never get a row-active shell, never
+  navigate and aren't nav items.
+- Why not a session attribute: session rows render the shared `RowButton`
+  with no session-specific attribute, and card-mode rows even drop their
+  actions slot. Selection state is the one signal the component itself
+  defines. Reading it **after** the click, not at press time, is the fix.
+
+**Smoke** (`scripts/smoke.mjs:436-518`), in its own phone context:
+1. Put Smoke alpha in main, then ⌃-click Smoke beta in the drawer (= open in
+   a new tab).
+2. Require Smoke alpha's row to be "open" and Smoke beta's "selected"
+   (screenshot `10-phone-drawer-two-open-sessions`: tabs "SMOKE ALPHA |
+   SMOKE BETA").
+3. Tap Smoke alpha. The drawer **must dismiss**, and Smoke alpha must then
+   be the selected row.
+
+- The run logs whether the route changed. Every run reported `no route
+  change`, so the focus-only case really is what's exercised.
+- Resuming a session on this provider-less gateway raises "Hermes couldn't
+  finish the reply" toasts over the drawer (upstream behaviour). The step
+  dismisses them via their "Dismiss notification" buttons before tapping.
+- The round-11 browsing assertions (drill-in / "All projects" keep the
+  drawer open) are unchanged and still pass.
+
+**Negative control:** `app/src/platform/phone-layout.ts` restored to round
+11 (`git show 3af0bf9:…`), rebuilt. Browsing still passes, the new
+assertion fails:
+
+```
+[phone] drawer browsing: project drill-in and "All projects" kept the drawer open
+SMOKE FAILED:
+[phone] focusing the already-open "Smoke alpha" left the drawer open — a focus switch is a selection
+exit=1
+```
+
+**Gates** (final code, in order, all exit 0):
+
+```
+npm run typecheck                               → exit 0
+npm run build                                   → exit 0
+npx vitest run src/platform                     → exit 0
+  Test Files  2 passed (2)
+  Tests  20 passed (20)
+npx vitest run src/app/open-session.test.ts     → exit 0
+  Test Files  1 passed (1)
+  Tests  24 passed (24)
+node --test scripts/smoke-classifier.test.mjs   → exit 0
+  # tests 8
+  # pass 8
+  # fail 0
+node scripts/smoke.mjs …                        → exit 0, 3 consecutive runs; after the negative
+                                                  control and a rebuild, 3 more consecutive runs
+```
+
+Final smoke run, verbatim (token redacted):
+
+```
+screenshot: /tmp/smoke-out/1-onboarding.png
+[tablet] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+[tablet] first-run overlay: provider picker after 1.7s (gateway has no model provider) → skipped
+[tablet] thread list: switched Smoke alpha → Smoke beta → Smoke alpha, transcripts followed
+screenshot: /tmp/smoke-out/2-connected-1280.png
+screenshot: /tmp/smoke-out/3-connected-tablet-820.png
+[phone] first-run overlay: none (provider configured or previously skipped)
+screenshot: /tmp/smoke-out/4-connected-phone-390.png
+[phone] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+[phone] thread list: switched Smoke alpha → Smoke beta → Smoke alpha, transcripts followed
+screenshot: /tmp/smoke-out/5-phone-drawer-open.png
+screenshot: /tmp/smoke-out/6-phone-settings.png
+screenshot: /tmp/smoke-out/7-phone-capabilities.png
+screenshot: /tmp/smoke-out/8-phone-onboarding.png
+[phone] first-run overlay: none (provider configured or previously skipped)
+[phone] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+screenshot: /tmp/smoke-out/9-phone-drawer-project.png
+[phone] drawer browsing: project drill-in and "All projects" kept the drawer open
+[phone] first-run overlay: none (provider configured or previously skipped)
+[phone] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+screenshot: /tmp/smoke-out/10-phone-drawer-two-open-sessions.png
+[phone] focus switch: Smoke beta → already-open Smoke alpha (no route change) dismissed the drawer
+page errors: 0 (none tolerated)
+SMOKE OK: onboarding → connected chat surface (tablet + phone), thread-list switching works, zero page errors, zero bridge errors
+exit=0
+```
+
 ### Round 11 (2026-10-23): drawer dismissal scope + smoke boundary coverage
 
 Gates, in this order, all exit 0 on the final build:
@@ -575,6 +690,8 @@ production build on `vite preview`, headless Chromium 155. The smoke:
   - Capabilities opens from the drawer, which closes on that navigation;
   - browsing inside the drawer (project drill-in, "All projects") keeps it
     open (round 11);
+  - switching focus to an already-open session (another tab) from the drawer
+    dismisses it, even without a route change (round 12);
   - onboarding (no gateway) has its URL field and Save on the first screen;
   - no horizontal overflow on chat, the session transcript, settings,
     capabilities and onboarding;

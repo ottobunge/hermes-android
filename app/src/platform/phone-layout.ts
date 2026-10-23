@@ -10,11 +10,13 @@
 //   2. the "HERMES AGENT" wordmark may shrink below its 2.75rem floor rather
 //      than clip;
 //   3. the statusbar scrolls sideways instead of clipping;
-//   4. the drawer closes on a tap outside it, when a tap inside navigates, or
-//      when a tap re-selects what is already showing (a nav item, or the
-//      selected session row — no URL change). Browsing controls inside the
-//      drawer (paging, project drill-in/Back, group expansion) keep it open.
-//      The hover-out dismissal never fires on touch;
+//   4. the drawer closes on a tap outside it, or when a tap inside SELECTS:
+//      it navigates, it is a nav item, or the tapped session row ends up the
+//      selected row — which also covers re-selecting the current session and
+//      switching focus to another already-open session, neither of which
+//      changes the URL. Browsing controls inside the drawer (paging, project
+//      drill-in/Back, group expansion) keep it open. The hover-out dismissal
+//      never fires on touch;
 //   5. overlay views (Settings, Scheduled jobs, …) keep their titlebar-height
 //      top inset but drop the ~44px side/bottom gutters, which left a 300px
 //      card on a 390px screen;
@@ -55,42 +57,50 @@ function closeDrawer(overlay: Element) {
   }
 }
 
-// Taps that SELECT even when the URL doesn't change: a nav item (every
-// sidebar menu-button calls onNavigate), or the tap target of the row that is
-// already the selected one (session-row.tsx paints its SidebarRowShell — the
-// RowButton's direct parent — with the row-active background). Every other
-// RowButton (chrome.tsx), e.g. "Show more" (workspace-header.tsx), project
-// drill-in/Back (overview-row.tsx) or group expansion (gateway-groups.tsx),
-// is browsing: it only closes the drawer if it actually navigates.
+// Taps that SELECT even when the URL doesn't change:
+//   - a nav item: every sidebar menu-button calls onNavigate;
+//   - a session row that is the selected row once the click has settled.
+//     session-row.tsx paints its SidebarRowShell — the RowButton's direct
+//     parent — with the row-active background while that session is the
+//     focused one (sidebar/index.tsx selection). A plain row click resumes the
+//     session via openSession, which may only FOCUS an already-open tile or
+//     tab (open-session.ts) — no route change, and the row was merely
+//     "open" (row-open background) at press time — so the check must run
+//     after the click, not at pointerdown.
+// Every other RowButton (chrome.tsx), e.g. "Show more" (workspace-header.tsx),
+// project drill-in/Back (overview-row.tsx) or group expansion
+// (gateway-groups.tsx), never gets a selected shell: it is browsing, and only
+// closes the drawer if it actually navigates.
 const NAV_ITEM = '[data-sidebar="menu-button"]'
 const SELECTED_ROW = '.bg-\\(--ui-row-active-background\\)'
+// Focus changes commit through the session stores a few frames after the
+// click; give the selection that long to land.
+const SELECTION_SETTLE_MS = 300
 
-function selectsInPlace(target: Element): boolean {
-  const rowButton = target.closest('[data-slot="row-button"]')
+// What a press inside the drawer began on; one delegated click handler acts
+// after the click, so nothing is attached per gesture.
+let press: null | { href: string; navItem: boolean; rowButton: Element | null } = null
 
-  return Boolean(target.closest(NAV_ITEM) || rowButton?.parentElement?.matches(SELECTED_ROW))
+function isSelectedRow(rowButton: Element | null): boolean {
+  return Boolean(rowButton?.isConnected && rowButton.parentElement?.matches(SELECTED_ROW))
 }
-
-// URL when a press inside the drawer began (and whether it pressed a
-// selectable row); one delegated click handler acts after the click, so
-// nothing is attached per gesture.
-let hrefAtPress: null | string = null
-let pressedRow = false
 
 function onPointerDown(event: PointerEvent) {
   const overlay = document.querySelector('[data-narrow-overlay]')
   const target = event.target as Element | null
-  hrefAtPress = null
-  pressedRow = false
+  press = null
 
   if (!overlay || !target || !window.matchMedia(SIDEBAR_COLLAPSE_MEDIA_QUERY).matches) {
     return
   }
 
   if (overlay.contains(target)) {
-    // A tap that navigates or selects a row hands the screen back.
-    hrefAtPress = location.href
-    pressedRow = selectsInPlace(target)
+    // A tap that selects hands the screen back (decided after the click).
+    press = {
+      href: location.href,
+      navItem: Boolean(target.closest(NAV_ITEM)),
+      rowButton: target.closest('[data-slot="row-button"]')
+    }
 
     return
   }
@@ -105,22 +115,35 @@ function onPointerDown(event: PointerEvent) {
 }
 
 function onClick() {
-  const before = hrefAtPress
-  const row = pressedRow
-  hrefAtPress = null
-  pressedRow = false
+  const pressed = press
+  press = null
 
-  if (before === null) {
+  if (!pressed) {
     return
   }
 
-  setTimeout(() => {
+  const started = performance.now()
+
+  const check = () => {
     const overlay = document.querySelector('[data-narrow-overlay]')
 
-    if (overlay && (row || location.href !== before)) {
-      closeDrawer(overlay)
+    if (!overlay) {
+      return
     }
-  })
+
+    if (pressed.navItem || location.href !== pressed.href || isSelectedRow(pressed.rowButton)) {
+      closeDrawer(overlay)
+
+      return
+    }
+
+    // Only a row press can still turn into a selection.
+    if (pressed.rowButton && performance.now() - started < SELECTION_SETTLE_MS) {
+      requestAnimationFrame(check)
+    }
+  }
+
+  setTimeout(check)
 }
 
 export function installPhoneLayout(): void {
@@ -129,13 +152,6 @@ export function installPhoneLayout(): void {
   style.textContent = PHONE_CSS
   document.head.appendChild(style)
   document.addEventListener('pointerdown', onPointerDown, true)
-  document.addEventListener(
-    'pointercancel',
-    () => {
-      hrefAtPress = null
-      pressedRow = false
-    },
-    true
-  )
+  document.addEventListener('pointercancel', () => (press = null), true)
   document.addEventListener('click', onClick, true)
 }

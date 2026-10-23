@@ -432,6 +432,91 @@ async function run() {
     }
   }
   await assertWorkspaceAlive(browsePage, 'phone')
+
+  // Focus switch between already-open sessions must dismiss the drawer
+  // (round 12). Smoke alpha in main, Smoke beta opened as a tab (⌃-click =
+  // open in new tab) and focused; then tapping Smoke alpha in the drawer only
+  // FOCUSES its open tab — no route change, and its row was merely "open"
+  // when pressed — yet it is a selection, so the drawer must go.
+  const focusCtx = await browser.newContext({ viewport: { width: 390, height: 844 }, storageState: storage, hasTouch: true, isMobile: true })
+  const focusPage = await focusCtx.newPage()
+  watch(focusPage, { label: 'phone' })
+  await focusPage.goto(args.app)
+  await focusPage.locator('[contenteditable="true"], textarea').first().waitFor({ timeout: 45_000 })
+  await settleFirstRun(focusPage, 'phone')
+  const focusDrawer = focusPage.locator('[data-narrow-overlay]')
+  const focusToggle = focusPage.getByRole('button', { name: /show sidebar|hide sidebar/i }).first()
+
+  // Resuming a session on a provider-less gateway raises "couldn't finish the
+  // reply" toasts at the top of the screen, over the drawer's rows.
+  async function dismissToasts(p) {
+    for (let i = 0; i < 10; i++) {
+      const dismiss = p.getByRole('button', { name: 'Dismiss notification' }).first()
+
+      if (!(await dismiss.count())) {
+        return
+      }
+
+      await dismiss.click({ timeout: 2_000 }).catch(() => {})
+    }
+  }
+
+  async function openFocusDrawer() {
+    await dismissToasts(focusPage)
+
+    if (!(await focusDrawer.count())) {
+      await focusToggle.tap({ timeout: 15_000 })
+    }
+
+    await focusDrawer.locator('[data-slot="sidebar"]').waitFor({ timeout: 15_000 })
+    await dismissToasts(focusPage)
+  }
+
+  const rowState = title =>
+    focusDrawer
+      .locator('[data-slot="row-button"]', { hasText: title })
+      .first()
+      .evaluate(button => {
+        const shell = button.parentElement?.className || ''
+
+        return shell.includes('row-active-background') ? 'selected' : shell.includes('row-open-background') ? 'open' : 'closed'
+      })
+      .catch(() => 'missing')
+
+  const focusProblems = problems.length
+  await openFocusDrawer()
+  await focusDrawer.getByText('Smoke alpha', { exact: true }).first().tap()
+  await focusDrawer.waitFor({ state: 'detached', timeout: 5_000 }).catch(() => {})
+  await openFocusDrawer()
+  await focusDrawer.getByText('Smoke beta', { exact: true }).first().click({ modifiers: ['Control'] })
+  await focusPage.waitForTimeout(1_500)
+  await openFocusDrawer()
+  const before = { alpha: await rowState('Smoke alpha'), beta: await rowState('Smoke beta'), url: focusPage.url() }
+
+  if (before.alpha !== 'open' || before.beta !== 'selected') {
+    problems.push(`[phone] focus-switch setup: expected Smoke alpha open + Smoke beta focused, got ${JSON.stringify(before)}`)
+  } else {
+    await shot(focusPage, '10-phone-drawer-two-open-sessions')
+    await focusDrawer.getByText('Smoke alpha', { exact: true }).first().tap()
+
+    if (!(await focusDrawer.waitFor({ state: 'detached', timeout: 5_000 }).then(() => true, () => false))) {
+      problems.push('[phone] focusing the already-open "Smoke alpha" left the drawer open — a focus switch is a selection')
+    }
+
+    await openFocusDrawer()
+    const after = await rowState('Smoke alpha')
+
+    if (after !== 'selected') {
+      problems.push(`[phone] tapping "Smoke alpha" did not focus it (row is ${after})`)
+    }
+
+    if (problems.length === focusProblems) {
+      const routed = focusPage.url() !== before.url ? 'route changed' : 'no route change'
+      console.log(`[phone] focus switch: Smoke beta → already-open Smoke alpha (${routed}) dismissed the drawer`)
+    }
+  }
+
+  await assertWorkspaceAlive(focusPage, 'phone')
 }
 
 try {
