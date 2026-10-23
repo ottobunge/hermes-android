@@ -11,7 +11,13 @@
 //      than clip;
 //   3. the statusbar scrolls sideways instead of clipping;
 //   4. the drawer closes on a tap outside it, or when a tap inside navigates
-//      (the hover-out dismissal never fires on touch).
+//      (the hover-out dismissal never fires on touch);
+//   5. overlay views (Settings, Scheduled jobs, …) keep their titlebar-height
+//      top inset but drop the ~44px side/bottom gutters, which left a 300px
+//      card on a 390px screen;
+//   6. the connection-mode cards (Settings → Gateway, onboarding) size to
+//      their own content instead of all matching the tallest one, so the
+//      URL/token fields aren't pushed below the fold on a one-column screen.
 //
 // Everything is gated on max-width 767.98px, so tablet (>=768px) is untouched.
 // Only leaf modules are imported: this runs before the renderer evaluates.
@@ -29,6 +35,8 @@ const PHONE_CSS = `
   [data-narrow-overlay] { top: ${TITLEBAR_HEIGHT / 16}rem; }
   .wordmark { --fit-min: 1.5rem !important; }
   [data-slot='statusbar'] > div { overflow-x: auto; scrollbar-width: none; }
+  [data-overlay-surface] { padding-inline: 0.5rem; padding-bottom: 0.5rem; }
+  .auto-rows-fr { grid-auto-rows: auto; }
 }
 `
 

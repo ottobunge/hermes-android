@@ -113,7 +113,51 @@ async function assertConnected(p, label) {
   }
 }
 
+// The upstream render loop can escape into the "workspace" pane's error
+// boundary ("“workspace” failed to render") — reproduced in upstream Electron
+// after typing into the composer (README "Deviations"). A crashed main
+// surface always fails the run.
+async function assertWorkspaceAlive(p, label) {
+  if (await p.getByText(/failed to render/).count()) {
+    problems.push(`[${label}] an error boundary is showing ("… failed to render") — the main surface crashed`)
+  }
+}
+
 await assertConnected(page, 'tablet')
+
+// First-run overlay (DesktopOnboardingOverlay). It shows "Starting Hermes…"
+// until the gateway answers setup.status + setup.runtime_check over the
+// WebSocket, then hides (provider configured) or shows the provider picker
+// (none configured — the scratch gateway). That is upstream behavior; what
+// would be a defect is never settling. Skipping the picker is a user action.
+async function settleFirstRun(p, label) {
+  const started = Date.now()
+  const gate = p.locator('.z-\\(--z-onboarding\\)')
+  const later = p.getByText(/choose a provider later/i)
+  const settled = await later
+    .or(p.locator('body:not(:has(.z-\\(--z-onboarding\\)))'))
+    .first()
+    .waitFor({ timeout: 30_000 })
+    .then(() => true, () => false)
+  const seconds = ((Date.now() - started) / 1000).toFixed(1)
+
+  if (!settled) {
+    problems.push(`[${label}] first-run overlay still "Starting Hermes…" after 30s (setup RPCs never answered)`)
+
+    return
+  }
+
+  if (await later.isVisible()) {
+    console.log(`[${label}] first-run overlay: provider picker after ${seconds}s (gateway has no model provider) → skipped`)
+    await later.click()
+    await gate.waitFor({ state: 'detached', timeout: 15_000 })
+  } else {
+    console.log(`[${label}] first-run overlay: none (provider configured or previously skipped)`)
+  }
+}
+
+await settleFirstRun(page, 'tablet')
+await assertWorkspaceAlive(page, 'tablet')
 
 // Production build ships the wordmark face (resolved from app/node_modules).
 const fontFaces = await page.evaluate(async () => (await document.fonts.load('700 32px Collapse')).length)
@@ -142,6 +186,16 @@ await assertConnected(page, 'tablet-820')
 await page.waitForTimeout(1_000)
 await shot(page, '3-connected-tablet-820')
 
+// Tablet parity: the phone CSS (phone-layout.ts) must not apply at >= 768px —
+// overlay views keep upstream's titlebar-height gutters on every side.
+await page.evaluate(() => (location.hash = '#/settings'))
+await page.locator('[data-overlay-surface]').waitFor({ timeout: 15_000 })
+const tabletGutter = await page.evaluate(() => parseFloat(getComputedStyle(document.querySelector('[data-overlay-surface]')).paddingLeft))
+if (!(tabletGutter >= 40)) {
+  problems.push(`[tablet-820] overlay side gutter is ${tabletGutter}px — phone CSS leaked to tablet width`)
+}
+await page.evaluate(() => (location.hash = '#/'))
+
 const storage = await context.storageState()
 const phone = await browser.newContext({ viewport: { width: 390, height: 844 }, storageState: storage, hasTouch: true, isMobile: true })
 const phonePage = await phone.newPage()
@@ -150,16 +204,40 @@ await phonePage.goto(args.app)
 // Phone: the sessions sidebar is a drawer (not mounted until opened), so the
 // connected surface is the composer + the titlebar's sidebar toggle.
 await phonePage.locator('[contenteditable="true"], textarea').first().waitFor({ timeout: 45_000 })
-// A gateway with no model provider puts the first-run provider picker over
-// the app; skipping it is a user action, not a boot failure.
-const later = phonePage.getByText(/choose a provider later/i)
-const gate = phonePage.locator('.z-\\(--z-onboarding\\)')
-await later.or(phonePage.locator('body:not(:has(.z-\\(--z-onboarding\\)))')).first().waitFor({ timeout: 45_000 })
-if (await later.isVisible()) {
-  await later.tap()
-  await gate.waitFor({ state: 'detached', timeout: 15_000 })
-}
+await settleFirstRun(phonePage, 'phone')
 await shot(phonePage, '4-connected-phone-390')
+
+async function phoneOverflow(surface) {
+  const overflow = await phonePage.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)
+
+  if (overflow > 0) {
+    problems.push(`[phone] ${surface} overflows the viewport by ${overflow}px`)
+  }
+}
+
+// Chat input usable at phone width: on screen, editable, and a tap focuses
+// it. The smoke deliberately does NOT type: typing intermittently crashes the
+// workspace pane through the upstream render loop — reproduced 3/4 in the
+// unmodified upstream Electron app (README "Deviations") — so a typing step
+// would make this gate flaky on an upstream defect, and tolerating it would
+// hide a crashed main surface.
+const composer = phonePage.locator('[contenteditable="true"], textarea').first()
+await composer.tap()
+const composerState = await composer.evaluate(element => {
+  const box = element.getBoundingClientRect()
+
+  return {
+    focused: element === document.activeElement || element.contains(document.activeElement),
+    editable: element.isContentEditable || (element.tagName === 'TEXTAREA' && !element.disabled && !element.readOnly),
+    onScreen: box.left >= 0 && box.right <= window.innerWidth && box.top >= 0 && box.bottom <= window.innerHeight
+  }
+})
+if (!composerState.focused || !composerState.editable || !composerState.onScreen) {
+  problems.push(`[phone] composer not usable: ${JSON.stringify(composerState)}`)
+}
+await phonePage.waitForTimeout(1_000)
+await assertWorkspaceAlive(phonePage, 'phone')
+await phoneOverflow('chat')
 
 const toggle = phonePage.getByRole('button', { name: /show sidebar|hide sidebar/i }).first()
 await toggle.tap({ timeout: 15_000 })
@@ -170,10 +248,64 @@ await shot(phonePage, '5-phone-drawer-open')
 await phonePage.touchscreen.tap(370, 400) // outside the drawer (max 85vw)
 await phonePage.locator('[data-narrow-overlay]').waitFor({ state: 'detached', timeout: 5_000 })
 
-const overflow = await phonePage.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)
-if (overflow > 0) {
-  problems.push(`[phone] page overflows the viewport by ${overflow}px`)
+await phoneOverflow('chat (drawer closed)')
+
+// Settings from the titlebar gear: the overlay card spans (nearly) the full
+// width — phone-layout drops the side gutters.
+await phonePage.getByRole('button', { name: /open settings/i }).first().tap({ timeout: 15_000 })
+await phonePage.locator('[data-overlay-surface]').waitFor({ timeout: 15_000 })
+await phonePage.waitForTimeout(1_000)
+const card = await phonePage.evaluate(() => {
+  const surface = document.querySelector('[data-overlay-surface]')
+  const box = surface.firstElementChild.getBoundingClientRect()
+
+  return { width: Math.round(box.width), viewport: window.innerWidth }
+})
+if (card.width < card.viewport - 24) {
+  problems.push(`[phone] settings card is ${card.width}px of a ${card.viewport}px viewport (side gutters not reduced)`)
 }
+await phoneOverflow('settings')
+await shot(phonePage, '6-phone-settings')
+await phonePage.evaluate(() => (location.hash = '#/'))
+await phonePage.locator('[data-overlay-surface]').waitFor({ state: 'detached', timeout: 10_000 })
+
+// Capabilities through the drawer: navigating from inside it closes it.
+await toggle.tap({ timeout: 15_000 })
+await phonePage.locator('[data-narrow-overlay]').getByText('Capabilities', { exact: true }).first().tap({ timeout: 15_000 })
+await phonePage.locator('[data-narrow-overlay]').waitFor({ state: 'detached', timeout: 5_000 })
+if (!/#\/capabilities/.test(phonePage.url())) {
+  problems.push(`[phone] drawer "Capabilities" did not navigate (at ${phonePage.url()})`)
+}
+await phonePage.waitForTimeout(1_500)
+await phoneOverflow('capabilities')
+await assertWorkspaceAlive(phonePage, 'phone')
+await shot(phonePage, '7-phone-capabilities')
+
+// Onboarding at phone width: the URL field and "Save and reconnect" sit in the
+// first screen (mode cards size to content) — no saved gateway in this context.
+const fresh = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true })
+const onboardingPage = await fresh.newPage()
+watch(onboardingPage, { label: 'onboarding' })
+await onboardingPage.goto(args.app)
+await onboardingPage.getByText('Connect to a Hermes gateway').waitFor({ timeout: 30_000 })
+const fold = await onboardingPage.evaluate(() => {
+  const url = document.querySelector('input[placeholder="https://gateway.example.com/hermes"]')
+  const save = [...document.querySelectorAll('button')].find(b => /save (and|&) reconnect/i.test(b.textContent || ''))
+
+  return {
+    url: url ? Math.round(url.getBoundingClientRect().bottom) : null,
+    save: save ? Math.round(save.getBoundingClientRect().bottom) : null,
+    height: window.innerHeight,
+    overflow: document.documentElement.scrollWidth - window.innerWidth
+  }
+})
+if (fold.url === null || fold.url > fold.height || fold.save === null || fold.save > fold.height) {
+  problems.push(`[phone] onboarding URL field / Save not in the first screen (url ${fold.url}, save ${fold.save}, viewport ${fold.height})`)
+}
+if (fold.overflow > 0) {
+  problems.push(`[phone] onboarding overflows the viewport by ${fold.overflow}px`)
+}
+await shot(onboardingPage, '8-phone-onboarding')
 
 await browser.close()
 

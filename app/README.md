@@ -12,8 +12,11 @@ React renderer from `upstream/apps/desktop` (v0.17.6, hermes-agent 0.21.5).
   640px (titlebar toggle → overlay, full-width transcript, docked composer);
   the phone layer fixes what breaks on a touch phone: the drawer sits below
   its toggle, it closes on a tap outside or when a tap inside navigates, the
-  "HERMES AGENT" wordmark shrinks instead of clipping, and the statusbar
-  scrolls sideways. All of it is gated on `max-width: 767.98px`.
+  "HERMES AGENT" wordmark shrinks instead of clipping, the statusbar
+  scrolls sideways, overlay views (Settings, Scheduled jobs, …) drop their
+  ~44px side gutters, and the connection-mode cards size to their content so
+  the gateway URL field is on the first screen. All of it is gated on
+  `max-width: 767.98px`; the smoke checks at 820px that it doesn't leak.
 - **Remote gateway only.** Android cannot spawn the local Python agent, so the
   app is a client for a Hermes gateway running elsewhere (`hermes serve`),
   using the desktop's existing remote-connection mode.
@@ -176,7 +179,27 @@ state.
 - **Phone layout covers presentation only.** Between 640 and 767px the rails
   stay docked (upstream's collapse breakpoint is 640px, not 768px). Below
   640px the drawer has no swipe gesture: open and close it with the titlebar
-  toggle or a tap outside. No bottom nav.
+  toggle or a tap outside. No bottom nav. Overlay views stay overlays (cards
+  over the app with a titlebar-height top inset), not full-screen routes.
+- **Typing into the composer can crash the main "workspace" pane: confirmed
+  upstream behavior, not a port defect.**
+  - Typing makes `@assistant-ui/tap` throw a second guard, "Maximum update
+    depth exceeded. This can happen when a resource repeatedly calls
+    setState inside useEffect." (`UpdateScheduler.markDirty`), alongside
+    more getSnapshot-guard errors.
+  - Intermittently, a getSnapshot error escapes into the workspace pane's
+    error boundary: "“workspace” failed to render … getSnapshot should be
+    cached", with a Retry button. The composer text itself is accepted.
+  - Reproduced on 2026-10-23, at both 390 and 1280px, so not phone-specific:
+    - **port:** 3/6 runs that typed right after boot crashed, 0/2 that waited
+      ~8 s; in one smoke run it also crashed later, while the drawer was
+      open, after typing had already settled;
+    - **unmodified upstream Electron** (round-4 harness, real preload, same
+      scratch gateway): **3/4** runs that typed right after boot crashed,
+      with the same 2× markDirty + getSnapshot errors.
+  - Not fixed: the fix belongs in the upstream thread-list store / tap
+    usage, not in the Android layer. The smoke therefore doesn't type (see
+    "Smoke"), and it fails if the workspace ever shows the error boundary.
 - **Render-loop errors on every page: the original loop is confirmed
   upstream behavior, not a port defect.** Each boot throws several (4–9 observed) uncaught `Maximum update depth exceeded.
   The result of getSnapshot should be cached…` errors at every width. Traced
@@ -242,7 +265,8 @@ hermes gateway run &                       # initializes state.db (else /api/ses
 
 ## Verification
 
-Round 7 (2026-10-23, review-panel R3 fix). Gates run in this order, all exit 0:
+Round 9 (2026-10-23, phone layout polish + first-run overlay diagnosis).
+Gates run in this order, all exit 0:
 
 ```
 npm run typecheck                               → exit 0
@@ -265,8 +289,14 @@ node --test scripts/smoke-classifier.test.mjs   → exit 0
   # tests 11
   # pass 11
   # fail 0
-node scripts/smoke.mjs …                        → exit 0 (output below)
+node scripts/smoke.mjs …                        → exit 0, three consecutive runs (output below)
 ```
+
+- **`dist/` was stale at the start of round 9.** `dist/index.html` referenced
+  an `index-*.js` the build directory no longer contained, so the preview's
+  HTML fallback answered `200 text/html` for it and the page stayed blank.
+  It was rebuilt before every measurement; `npm run build` before a smoke is
+  mandatory.
 
 - **`bridge.test.ts` (18 tests).** Beyond URL/transport mapping it covers:
   - cross-host blank-token refusal on both save paths;
@@ -291,6 +321,25 @@ node scripts/smoke.mjs …                        → exit 0 (output below)
   12–15s timeouts under heavy host load. Not triaged. No tests are excluded.
 - `cap sync` / gradle — **not run** (no `android/`, no SDK).
 
+### Phone audit (round 9, 390×844, touch, production build)
+
+Each surface was walked in headless Chromium against the scratch gateway.
+Measured: document overflow, plus visible text or controls extending past
+the viewport outside the drawer. Each screenshot was also reviewed by eye.
+
+| Surface | Before | Fix (phone-layout.ts) | After |
+| --- | --- | --- | --- |
+| Chat | no overflow; statusbar's last pill past the edge, inside the row that already scrolls (round 3) | — | unchanged |
+| Sessions drawer | fine (round 3 fixes) | — | unchanged |
+| Settings (titlebar gear) | overlay card 300px of 390 (44px gutters each side); body copy wraps to 3–4 lines | `[data-overlay-surface]` side/bottom padding → `0.5rem` | card 374px |
+| Scheduled jobs | same 300px card; blueprint list squeezed into a short scroll box | same rule | card 374px, full blueprint list visible |
+| Capabilities / Skills | no overflow | — | unchanged |
+| Messaging / Profiles | no overflow | — | unchanged |
+| Onboarding | the four connection-mode cards all as tall as the tallest (`auto-rows-fr`, ~116px each); URL field and Save below the fold | `.auto-rows-fr` → `grid-auto-rows: auto` (only used by that grid) | URL field and "Save and reconnect" on the first screen |
+
+The "Search Ctrl K" pill straddling the top edge of overlay cards is
+upstream's design (also at desktop widths) and was left alone.
+
 ### Smoke: executed, PASSED (bounded render-loop errors at the guard site tolerated)
 
 Scratch gateway (`hermes serve --port 19719` + `hermes gateway run`,
@@ -300,7 +349,22 @@ preview`, headless Chromium 155. The smoke:
 - asserts the connected surface at 1280 **and** 820px;
 - checks that the Collapse font loads and that a `<webview>` reports
   "unavailable";
-- runs the phone drawer open/close and overflow check.
+- waits for the first-run overlay to settle, and fails if it's still
+  "Starting Hermes…" after 30 s;
+- at 820px, checks that overlay views keep upstream's ≥ 40px side gutters
+  (the phone CSS must not leak to tablet);
+- runs the phone checks:
+  - the composer is on screen, editable and focusable by tap. It
+    deliberately does **not** type, because typing intermittently crashes
+    the workspace through the upstream loop (see "Deviations");
+  - the drawer opens and closes;
+  - Settings opens from the titlebar with a card within 24px of the viewport
+    width;
+  - Capabilities opens from the drawer, which closes on that navigation;
+  - onboarding (no gateway) has its URL field and Save on the first screen;
+  - no horizontal overflow on chat, settings, capabilities and onboarding;
+- fails whenever an error boundary shows "… failed to render", at 1280px
+  and twice on phone.
 
 **Guard site, derived from the build.** Before launching the browser, the
 smoke scans the served build's JS assets (`--dist`, default `dist/`) for the
@@ -352,24 +416,29 @@ tolerated only if **all** of these hold, and anything else fails the run:
   (`capabilities-B1fqOH3C.js:32:127`, off-by-one columns, the right location
   in a different file).
 
-Output, verbatim (token redacted):
+Output of the third consecutive round-9 run, verbatim (token redacted; runs 1 and 2 also exited 0):
 
 ```
 render-loop guard site: capabilities-B1fqOH3C.js:4:1991
 screenshot: /tmp/smoke-out/1-onboarding.png
 [tablet] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+[tablet] first-run overlay: provider picker after 2.2s (gateway has no model provider) → skipped
 screenshot: /tmp/smoke-out/2-connected-1280.png
 screenshot: /tmp/smoke-out/3-connected-tablet-820.png
-[phone] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+[phone] first-run overlay: none (provider configured or previously skipped)
 screenshot: /tmp/smoke-out/4-connected-phone-390.png
+[phone] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
 screenshot: /tmp/smoke-out/5-phone-drawer-open.png
-[tablet] baseline-shaped render-loop pageerror ×7 (tolerated, bound 21): guard message, top frame exactly at the guard site
-[phone] baseline-shaped render-loop pageerror ×7 (tolerated, bound 21): guard message, top frame exactly at the guard site
+screenshot: /tmp/smoke-out/6-phone-settings.png
+screenshot: /tmp/smoke-out/7-phone-capabilities.png
+screenshot: /tmp/smoke-out/8-phone-onboarding.png
+[tablet] baseline-shaped render-loop pageerror ×8 (tolerated, bound 21): guard message, top frame exactly at the guard site
+[phone] baseline-shaped render-loop pageerror ×9 (tolerated, bound 21): guard message, top frame exactly at the guard site
 SMOKE OK: onboarding → connected chat surface (tablet + phone), page errors limited to the bounded baseline render-loop shape, zero bridge errors
 exit=0
 ```
 
-**Fail-closed check, real browser.** The same smoke against the same server,
+**Fail-closed check, real browser (round 7).** The same smoke against the same server,
 with `--dist` pointed at an empty directory so no guard site can be found
 (excerpt, token redacted):
 
@@ -407,15 +476,33 @@ Electron desktop takes the same path (`hasRegistryTopology()` is true whenever
 defect**. It is fire-and-forget, and the renderer re-arms it on the next
 session-list refresh. Not changed.
 
-**The tablet "Let's get you setup with Hermes Agent / Starting Hermes…"
-overlay** is `DesktopOnboardingOverlay` (`src/components/onboarding/index.tsx`).
-It renders until `refreshOnboarding` → `checkRuntime` resolves
-`$desktopOnboarding.configured`. It shows "Starting Hermes…" while that is
-`null` and the provider picker when it is `false`, and it hides when it is
-`true`. So the overlay is purely the scratch gateway having no model
-provider. Once loaded it showed "Hermes is not connected to any AI provider
-yet", and "I'll choose a provider later" dismisses it (the phone step does
-that).
+**The first-run "Let's get you setup with Hermes Agent / Starting Hermes…
+100%" overlay (round 9 diagnosis): not stuck, and the same as upstream.**
+- It is `DesktopOnboardingOverlay` (`src/components/onboarding/index.tsx`).
+  It shows "Starting Hermes…" while `$desktopOnboarding.configured` is
+  `null`. `refreshOnboarding` → `checkRuntime` → `evaluateRuntimeReadiness`
+  then issues **two WebSocket RPCs in parallel, `setup.status` and
+  `setup.runtime_check`**, and the overlay becomes the provider picker
+  (`configured: false`) or hides (`true`).
+- Timeline measured in the production build at 1280px against the scratch
+  gateway:
+  - 2.8 s: "Starting Hermes…";
+  - 5.1 s: WS open, both RPCs sent;
+  - `setup.status` answers in 472 ms with `{"provider_configured":false,…}`;
+  - `setup.runtime_check` answers in 884 ms with `{"ok":false,"error":"Hermes
+    is not connected to any AI provider yet. …"}`;
+  - 7.8 s: provider picker.
+- So nothing blocks. The overlay waits for the WebSocket connect plus those
+  two RPCs, and the scratch gateway has no model provider. Earlier rounds'
+  "stuck at 100%" screenshots were taken ~2 s after the connected DOM
+  appeared, before the WebSocket had opened. That was worse under that day's
+  heavy host load (load average 13–53).
+- **Upstream Electron shows the same picker** for the same gateway, in the
+  round-4 and round-9 runs with upstream's own preload.
+- The smoke is now aware of it. It waits up to 30 s for the overlay to
+  settle, logs which state it reached and how long it took, skips the picker
+  ("I'll choose a provider later"), and **fails if it is still "Starting
+  Hermes…" after 30 s**, which would mean the setup RPCs never answered.
 
 ### Upstream comparison (round 4): the render loop reproduces in Electron
 
