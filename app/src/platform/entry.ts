@@ -15,7 +15,11 @@ installWebviewFallback()
 // A gated-gateway sign-in comes back as a fresh page load (oauth.ts): redeem
 // it before deciding what to boot, so a successful sign-in boots connected.
 void completeOauthRedirect().then(() => {
-  if (!loadGateway()) {
+  const gateway = loadGateway()
+
+  // No gateway, or a gated one that is signed out (sign-out, expired
+  // session): the Gateway screen, with its URL, is where to sign in again.
+  if (!gateway || (gateway.authMode === 'oauth' && !gateway.token)) {
     void import('./onboarding').then(({ mountOnboarding }) => mountOnboarding())
 
     return

@@ -38,6 +38,8 @@ export const OAUTH_REDIRECT_URI = 'http://127.0.0.1/'
 // than a login takes is abandoned.
 const PENDING_TTL_MS = 30 * 60 * 1000
 const REFRESH_AHEAD_S = 60
+// Every OAuth exchange (code redemption, refresh) is bounded, body included.
+export const OAUTH_FETCH_TIMEOUT_MS = 30_000
 
 interface PendingSignIn {
   baseUrl: string
@@ -50,6 +52,43 @@ interface BearerPayload {
   access_token?: string
   refresh_token?: string
   expires_at?: number
+}
+
+/**
+ * POST JSON and read the JSON reply under ONE deadline covering headers and
+ * body. It races the abort itself, so even a reply that ignores the signal
+ * cannot hold the caller past the deadline. Never retried here: a one-time
+ * code must not be replayed.
+ */
+async function exchangeJson(url: string, body: unknown): Promise<{ status: number; data: unknown }> {
+  const controller = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | undefined
+
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort()
+      reject(new Error(`timed out after ${OAUTH_FETCH_TIMEOUT_MS / 1000}s`))
+    }, OAUTH_FETCH_TIMEOUT_MS)
+  })
+
+  try {
+    return await Promise.race([
+      (async () => {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: controller.signal
+        })
+        const data = await res.json().catch(() => null)
+
+        return { status: res.status, data }
+      })(),
+      deadline
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 export interface OauthNotice {
@@ -82,8 +121,12 @@ export async function pkceChallenge(verifier: string): Promise<string> {
 // ── Start ────────────────────────────────────────────────────────────────────
 
 /** Persist the pending sign-in and hand the authorize URL to `navigate`
- *  (a whole-page navigation: this page unloads). */
-export async function startOauthLogin(remoteUrl: string, navigate: (url: string) => void): Promise<void> {
+ *  (a whole-page navigation: this page unloads). On Android that is the
+ *  native HermesOauth.beginSignIn — see bridge.ts. */
+export async function startOauthLogin(
+  remoteUrl: string,
+  navigate: (url: string) => Promise<void> | void
+): Promise<void> {
   const baseUrl = normalizeRemoteBaseUrl(remoteUrl)
   const verifier = randomToken()
   const pending: PendingSignIn = { baseUrl, verifier, state: randomToken(), createdAt: Date.now() }
@@ -95,7 +138,13 @@ export async function startOauthLogin(remoteUrl: string, navigate: (url: string)
   })
 
   localStorage.setItem(OAUTH_PENDING_KEY, JSON.stringify(pending))
-  navigate(`${baseUrl}/auth/native/authorize?${query}`)
+
+  try {
+    await navigate(`${baseUrl}/auth/native/authorize?${query}`)
+  } catch (error) {
+    localStorage.removeItem(OAUTH_PENDING_KEY)
+    throw error
+  }
 }
 
 // ── Complete (runs in entry.ts before the app boots) ────────────────────────
@@ -185,15 +234,12 @@ export async function completeOauthRedirect(win: Window = window): Promise<Oauth
   }
 
   try {
-    const res = await fetch(`${pending.baseUrl}/auth/native/token`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code, code_verifier: pending.verifier })
-    })
-    const tokens = res.ok ? tokensFrom((await res.json()) as BearerPayload) : null
+    const res = await exchangeJson(`${pending.baseUrl}/auth/native/token`, { code, code_verifier: pending.verifier })
+    const ok = res.status >= 200 && res.status < 300
+    const tokens = ok ? tokensFrom((res.data ?? {}) as BearerPayload) : null
 
     if (!tokens) {
-      throw new Error(res.ok ? 'the gateway returned no access token' : `the gateway answered ${res.status}`)
+      throw new Error(ok ? 'the gateway returned no access token' : `the gateway answered ${res.status}`)
     }
 
     const existing = loadGateway()
@@ -216,57 +262,59 @@ export async function completeOauthRedirect(win: Window = window): Promise<Oauth
 
 // ── Refresh ──────────────────────────────────────────────────────────────────
 
-const refreshes = new Map<string, Promise<void>>()
+// Bumped by sign-out (invalidateOauthSession). A refresh that started before a
+// sign-out must not hand its result to anyone afterwards — not to a gateway
+// object, not to storage.
+let authEpoch = 0
 
-function persistIfSaved(gateway: SavedGateway, previous: { token?: string; refreshToken?: string }) {
+type RefreshOutcome = { kind: 'expired' } | { kind: 'ok'; tokens: Pick<SavedGateway, 'refreshToken' | 'token' | 'tokenExpiresAt'> }
+
+const refreshes = new Map<string, Promise<RefreshOutcome>>()
+
+/** Sign-out: every in-flight or later-completing refresh result is void. */
+export function invalidateOauthSession(): void {
+  authEpoch++
+  refreshes.clear()
+}
+
+function signedOutError(baseUrl: string) {
+  return Object.assign(new Error(`401: Signed out of ${hostLabel(baseUrl)}. Sign in again.`), { statusCode: 401 })
+}
+
+function persistIfSaved(
+  baseUrl: string,
+  previous: { token?: string; refreshToken: string },
+  next: Pick<SavedGateway, 'refreshToken' | 'token' | 'tokenExpiresAt'>
+) {
   const stored = loadGateway()
 
   // Only the stored copy of THIS credential — a different gateway may have
-  // been saved for the next launch meanwhile.
+  // been saved for the next launch meanwhile, or the user signed out.
   if (
     stored &&
-    normalizeRemoteBaseUrl(stored.httpUrl) === normalizeRemoteBaseUrl(gateway.httpUrl) &&
+    normalizeRemoteBaseUrl(stored.httpUrl) === normalizeRemoteBaseUrl(baseUrl) &&
     stored.authMode === 'oauth' &&
     (stored.token === previous.token || stored.refreshToken === previous.refreshToken)
   ) {
-    saveGateway({ ...stored, token: gateway.token, refreshToken: gateway.refreshToken, tokenExpiresAt: gateway.tokenExpiresAt })
+    saveGateway({ ...stored, ...next })
   }
 }
 
-/** Rotate the gateway's tokens IN PLACE (the bridge's booted gateway object)
- *  and in storage. Concurrent callers share one request. A rejected refresh
- *  token (401 session_expired) clears the tokens and throws. */
-export function refreshOauthTokens(gateway: SavedGateway, baseUrl: string): Promise<void> {
-  const refreshToken = gateway.refreshToken
-
-  if (gateway.authMode !== 'oauth' || !refreshToken) {
-    return Promise.reject(new Error('No refresh token for this gateway; sign in again.'))
-  }
-
-  const inflight = refreshes.get(refreshToken)
-
-  if (inflight) {
-    return inflight
-  }
-
-  const run = (async () => {
-    const previous = { token: gateway.token, refreshToken }
-    const res = await fetch(`${baseUrl}/auth/native/refresh`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ refresh_token: refreshToken })
-    })
+/** One network refresh per refresh token. Persists its own result (guarded)
+ *  BEFORE any caller applies it, so storage is never behind a running client. */
+function runRefresh(baseUrl: string, previous: { token?: string; refreshToken: string }, epoch: number) {
+  const run = (async (): Promise<RefreshOutcome> => {
+    const res = await exchangeJson(`${baseUrl}/auth/native/refresh`, { refresh_token: previous.refreshToken })
 
     if (res.status === 401) {
-      Object.assign(gateway, { token: undefined, refreshToken: undefined, tokenExpiresAt: undefined })
-      persistIfSaved(gateway, previous)
+      if (epoch === authEpoch) {
+        persistIfSaved(baseUrl, previous, { token: undefined, refreshToken: undefined, tokenExpiresAt: undefined })
+      }
 
-      throw Object.assign(new Error(`401: Signed out of ${hostLabel(baseUrl)} (session expired). Sign in again.`), {
-        statusCode: 401
-      })
+      return { kind: 'expired' }
     }
 
-    const tokens = res.ok ? tokensFrom((await res.json()) as BearerPayload) : null
+    const tokens = res.status >= 200 && res.status < 300 ? tokensFrom((res.data ?? {}) as BearerPayload) : null
 
     if (!tokens) {
       throw Object.assign(new Error(`${res.status}: Could not refresh the sign-in for ${hostLabel(baseUrl)}.`), {
@@ -274,17 +322,63 @@ export function refreshOauthTokens(gateway: SavedGateway, baseUrl: string): Prom
       })
     }
 
-    Object.assign(gateway, { refreshToken: tokens.refreshToken ?? refreshToken, token: tokens.token, tokenExpiresAt: tokens.tokenExpiresAt })
-    persistIfSaved(gateway, previous)
+    const next = { ...tokens, refreshToken: tokens.refreshToken ?? previous.refreshToken }
+
+    if (epoch === authEpoch) {
+      persistIfSaved(baseUrl, previous, next)
+    }
+
+    return { kind: 'ok', tokens: next }
   })()
 
-  refreshes.set(refreshToken, run)
-  run.then(
-    () => refreshes.delete(refreshToken),
-    () => refreshes.delete(refreshToken)
-  )
+  refreshes.set(previous.refreshToken, run)
+  // Released on success, failure or timeout alike (exchangeJson is bounded).
+  const release = () => {
+    if (refreshes.get(previous.refreshToken) === run) {
+      refreshes.delete(previous.refreshToken)
+    }
+  }
+  run.then(release, release)
 
   return run
+}
+
+/**
+ * Rotate the gateway's tokens. Concurrent callers share one request, and the
+ * result is applied to EVERY caller's gateway object that still holds the
+ * pre-refresh refresh token (the booted gateway and fresh loadGateway()
+ * copies alike), not just the first. A rejected refresh token (401
+ * session_expired) clears them and throws; a sign-out in the meantime voids
+ * the result entirely.
+ */
+export async function refreshOauthTokens(gateway: SavedGateway, baseUrl: string): Promise<void> {
+  const refreshToken = gateway.refreshToken
+
+  if (gateway.authMode !== 'oauth' || !refreshToken) {
+    throw new Error('No refresh token for this gateway; sign in again.')
+  }
+
+  const epoch = authEpoch
+  const previous = { token: gateway.token, refreshToken }
+  const outcome = await (refreshes.get(refreshToken) ?? runRefresh(baseUrl, previous, epoch))
+
+  if (epoch !== authEpoch) {
+    throw signedOutError(baseUrl)
+  }
+
+  // Another caller sharing this object may already have applied it.
+  if (gateway.refreshToken === refreshToken) {
+    Object.assign(
+      gateway,
+      outcome.kind === 'ok' ? outcome.tokens : { token: undefined, refreshToken: undefined, tokenExpiresAt: undefined }
+    )
+  }
+
+  if (outcome.kind === 'expired') {
+    throw Object.assign(new Error(`401: Signed out of ${hostLabel(baseUrl)} (session expired). Sign in again.`), {
+      statusCode: 401
+    })
+  }
 }
 
 /** Before handing out a WebSocket URL: refresh an access token that is about

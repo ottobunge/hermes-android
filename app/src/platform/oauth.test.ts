@@ -39,9 +39,39 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
 })
+
+/** A fetch double whose /auth/native/refresh reply is held until release(). */
+function heldRefresh(authorizedBearer = 'Bearer access-2') {
+  let release!: (response: Response) => void
+  let started!: () => void
+  const refreshStarted = new Promise<void>(resolve => (started = resolve))
+  const seen: string[] = []
+
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+    if (url.endsWith('/auth/native/refresh')) {
+      started()
+
+      return new Promise<Response>(resolve => (release = resolve))
+    }
+
+    if (url.endsWith('/auth/logout')) {
+      return json(200, {})
+    }
+
+    const bearer = headerOf(init, 'Authorization') ?? ''
+    seen.push(bearer)
+
+    return bearer === authorizedBearer ? json(200, { ok: true }) : json(401, { detail: 'Unauthorized' })
+  })
+
+  vi.stubGlobal('fetch', fetchMock)
+
+  return { fetchMock, refreshStarted, release: (response: Response) => release(response), seen }
+}
 
 describe('transport auth header', () => {
   it('sends Bearer for oauth gateways and the session token otherwise — never both', async () => {
@@ -279,7 +309,9 @@ describe('bridge in gated mode', () => {
     expect(settled).toBe(false)
   })
 
-  it('logout clears the sign-in and tells the gateway with Bearer', async () => {
+  it('logout clears the sign-in, tells the gateway with Bearer, then reloads the page', async () => {
+    vi.useFakeTimers()
+    const reload = vi.spyOn(pageLifecycle, 'reload').mockImplementation(() => {})
     saveGateway(oauthGateway())
     const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response(null, { status: 200 }))
     vi.stubGlobal('fetch', fetchMock)
@@ -289,6 +321,10 @@ describe('bridge in gated mode', () => {
     expect(headerOf(fetchMock.mock.calls[0][1], 'Authorization')).toBe('Bearer access-1')
     expect(loadGateway()).toMatchObject({ authMode: 'oauth', token: undefined, refreshToken: undefined })
     await expect(bridge.getConnectionConfig(null)).resolves.toMatchObject({ remoteOauthConnected: false })
+    // Persisted first (above), THEN the reload that ends every live socket.
+    expect(reload).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(reload).toHaveBeenCalledTimes(1)
   })
 
   it('a gated gateway connects with the access token on REST and the WebSocket', async () => {
@@ -300,5 +336,133 @@ describe('bridge in gated mode', () => {
 
     expect(conn).toMatchObject({ authMode: 'oauth', token: 'access-1', wsUrl: 'wss://gw.example/api/ws?token=access-1' })
     expect(headerOf(fetchMock.mock.calls[0][1], 'Authorization')).toBe('Bearer access-1')
+  })
+})
+
+describe('round 17: refresh ownership, logout races, bounded exchanges', () => {
+  it('a shared refresh reaches EVERY caller holding the same credential, not just the first object', async () => {
+    const first = oauthGateway()
+    const second = oauthGateway() // e.g. a fresh loadGateway() copy
+    const held = heldRefresh()
+
+    const results = Promise.allSettled([
+      gatewayApi(first, { path: '/api/a' }, BASE),
+      gatewayApi(second, { path: '/api/b' }, BASE)
+    ])
+    await held.refreshStarted
+    await new Promise(resolve => setTimeout(resolve, 0))
+    held.release(json(200, { access_token: 'access-2', refresh_token: 'refresh-2' }))
+
+    expect((await results).map(result => result.status)).toEqual(['fulfilled', 'fulfilled'])
+    expect([first.token, second.token]).toEqual(['access-2', 'access-2'])
+    expect([first.refreshToken, second.refreshToken]).toEqual(['refresh-2', 'refresh-2'])
+    expect(held.fetchMock.mock.calls.filter(([url]) => url.endsWith('/auth/native/refresh'))).toHaveLength(1)
+  })
+
+  it('an expired refresh signs out every caller holding that credential', async () => {
+    const first = oauthGateway()
+    const second = oauthGateway()
+    const held = heldRefresh()
+
+    const results = Promise.allSettled([
+      gatewayApi(first, { path: '/api/a' }, BASE),
+      gatewayApi(second, { path: '/api/b' }, BASE)
+    ])
+    await held.refreshStarted
+    await new Promise(resolve => setTimeout(resolve, 0))
+    held.release(json(401, { error: 'session_expired' }))
+
+    expect((await results).map(result => result.status)).toEqual(['rejected', 'rejected'])
+    expect([first.token, second.token, first.refreshToken, second.refreshToken]).toEqual([
+      undefined,
+      undefined,
+      undefined,
+      undefined
+    ])
+  })
+
+  it('logout during a refresh voids its late success: no token comes back, in memory or storage', async () => {
+    vi.spyOn(pageLifecycle, 'reload').mockImplementation(() => {})
+    saveGateway(oauthGateway())
+    const held = heldRefresh()
+
+    const request = bridge.api({ path: '/api/config' })
+    await held.refreshStarted
+    await bridge.oauthLogoutConnectionConfig(BASE)
+    held.release(json(200, { access_token: 'access-2', refresh_token: 'refresh-2' }))
+
+    await expect(request).rejects.toThrow(/Signed out/)
+    // Signed out: bridge.api refuses up front (requireGateway throws on call).
+    await expect((async () => bridge.api({ path: '/api/config' }))()).rejects.toThrow(/Signed out/)
+    expect(held.seen).not.toContain('Bearer access-2')
+    expect(loadGateway()).toMatchObject({ token: undefined, refreshToken: undefined })
+  })
+
+  it('a stalled code exchange gives up after 30 s with a visible failure — the code is never replayed', async () => {
+    vi.useFakeTimers()
+    localStorage.setItem(
+      OAUTH_PENDING_KEY,
+      JSON.stringify({ baseUrl: BASE, verifier: 'v', state: 's', createdAt: Date.now() })
+    )
+    history.replaceState(null, '', '/?oauth-code=c&oauth-state=s')
+    // Never answers, and ignores the abort signal: the deadline must still win.
+    const fetchMock = vi.fn((_url: string, _init?: RequestInit) => new Promise<Response>(() => {}))
+    vi.stubGlobal('fetch', fetchMock)
+
+    let result: string | undefined
+    void completeOauthRedirect().then(value => (result = value))
+    await vi.advanceTimersByTimeAsync(29_000)
+    expect(result).toBeUndefined()
+    await vi.advanceTimersByTimeAsync(1_500)
+
+    expect(result).toBe('failed')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock.mock.calls[0][1]?.signal?.aborted).toBe(true)
+    expect(takeOauthNotice()).toMatchObject({ kind: 'failed', message: expect.stringMatching(/timed out after 30s/) })
+    expect(localStorage.getItem(GATEWAY_STORAGE_KEY)).toBeNull()
+  })
+
+  it('a stalled refresh fails the request after 30 s and releases the single-flight entry', async () => {
+    vi.useFakeTimers()
+    const refreshCalls: string[] = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (url.endsWith('/auth/native/refresh')) {
+          refreshCalls.push(url)
+
+          return new Promise<Response>(() => {})
+        }
+
+        return json(401, {})
+      })
+    )
+
+    const gateway = oauthGateway()
+    let outcome: string | undefined
+    void gatewayApi(gateway, { path: '/api/config', timeoutMs: 25 }, BASE).then(
+      () => (outcome = 'fulfilled'),
+      error => (outcome = String(error.message))
+    )
+    await vi.advanceTimersByTimeAsync(31_000)
+    expect(outcome).toMatch(/timed out after 30s/)
+
+    // Released: the next 401 starts a NEW refresh instead of awaiting the dead one.
+    void refreshOauthTokens(gateway, BASE).catch(() => {})
+    await vi.advanceTimersByTimeAsync(0)
+    expect(refreshCalls).toHaveLength(2)
+    await vi.advanceTimersByTimeAsync(31_000)
+  })
+
+  it('a reply whose body stalls after the headers is bounded too', async () => {
+    vi.useFakeTimers()
+    const stalledBody = { status: 200, json: () => new Promise(() => {}) } as unknown as Response
+    vi.stubGlobal('fetch', vi.fn(async () => stalledBody))
+
+    let error: Error | undefined
+    void refreshOauthTokens(oauthGateway(), BASE).catch(e => (error = e))
+    await vi.advanceTimersByTimeAsync(30_500)
+
+    expect(error?.message).toMatch(/timed out after 30s/)
   })
 })

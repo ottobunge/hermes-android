@@ -88,14 +88,14 @@ WebView capabilities and has not been verified on an Android device.
 - `getGatewayWsUrl` / `getGatewayWsUrlFor` — `ws(s)://…/api/ws?token=…` from the booted gateway (session token, or the sign-in's access token, refreshed first if it is about to expire)
 - `getProfileRoutes` — every profile routes to the one gateway
 - `probeConnectionConfig` — public `/api/status`; on a gated gateway (`auth_required`) also the public `/api/auth/providers` list → `authMode: 'oauth'` + providers (`supportsPassword` drives the panel's "Sign in" copy)
-- `oauthLoginConnectionConfig` — gated-gateway sign-in via the gateway's native RFC 8252 flow (PKCE S256 + state, `/auth/native/authorize` → the gateway's own login page → loopback callback intercepted by `MainActivity` → `/auth/native/token`). The page navigates away, so the promise never settles; the sign-in completes on the next page load (round 16)
-- `oauthLogoutConnectionConfig` — clears the sign-in locally (stored and running) and tells the gateway `/auth/logout` best-effort with Bearer; see "Gated gateways" for the revocation limit
+- `oauthLoginConnectionConfig` — gated-gateway sign-in via the gateway's RFC 8252 native-app endpoints (PKCE S256 + state, `/auth/native/authorize` → the gateway's own login page → loopback callback → `/auth/native/token`), run in the app's WebView rather than an external browser (an accepted deviation from RFC 8252 §8.12, see "Gated gateways"). On Android it starts through the native `HermesOauth.beginSignIn`, which detaches every native JavaScript interface first. The page navigates away, so the promise never settles; the sign-in completes on the next page load (rounds 16–17)
+- `oauthLogoutConnectionConfig` — voids any in-flight refresh, tells the gateway `/auth/logout` best-effort with Bearer, clears the stored and running credentials, then **reloads the page**, so no authenticated socket survives (round 17); see "Gated gateways" for the server-side revocation limit
 
 ### Web equivalent
 
 - `getConnection` / `getConnectionFor` — `/api/status` probe → `HermesConnection` (mode `remote`, token, wsUrl)
 - `revalidateConnection` — re-probes `/api/status`
-- `api` — fetch with session-token auth (or Bearer + one refresh-and-retry on a gated gateway), whole-exchange timeout, multipart upload
+- `api` — fetch with session-token auth (or Bearer + one refresh-and-retry on a gated gateway), whole-exchange timeout on the request itself (a refresh leg it triggers is bounded separately, 30 s), multipart upload
 - `getConnectionConfig` / `saveConnectionConfig` / `applyConnectionConfig` / `testConnectionConfig` — drive the reused Gateway settings panel (remote only; token mode or a gated gateway's sign-in; save persists for the next boot — an OAuth save before signing in is a no-op; apply = test → save → reload; test without a usable token or sign-in fails)
 - `connections.list` / `.save` / `.test` — a one-entry registry; `.save` changes to endpoint or token go through test → save → reload, label-only edits save in place
 - `profile.get` / `.set` / `.remember` / `.getDefault` / `.setDefault` — localStorage (no backend relaunch)
@@ -157,9 +157,29 @@ state.
   them errors ("Android connects to a remote Hermes gateway only").
 - **Gated gateways (round 16).** A `hermes serve` with dashboard auth
   (`dashboard.basic_auth` or OAuth providers) is signed into with the
-  gateway's native RFC 8252 flow. REST then carries `Authorization: Bearer`,
-  the WebSocket `?token=<access>`, and a 401 rotates the tokens once via
-  `/auth/native/refresh`. Limits:
+  gateway's RFC 8252 native-app endpoints. REST then carries `Authorization:
+  Bearer`, the WebSocket `?token=<access>`, and a 401 rotates the tokens once
+  via `/auth/native/refresh`. Code redemption and refresh are bounded at 30 s
+  each, response body included. Signing out reloads the page. Limits:
+  - **Embedded user agent: a deliberate deviation from RFC 8252 §8.12**, which
+    requires an external browser for native-app authorization. The sign-in
+    runs in the app's own WebView, so the app can observe what the user types
+    on the gateway's (or IdP's) page. That is accepted for a client of the
+    user's own gateway, and **mitigated** (round 17):
+    - only the app can start sign-in mode (`HermesOauth.beginSignIn`);
+    - **every** Java object Capacitor exposes with `addJavascriptInterface`
+      (`androidBridge` on the fallback path, `CapacitorHttpAndroidInterface`,
+      `CapacitorCookiesAndroidInterface`) is removed before the foreign page
+      loads and restored before the app origin loads again;
+    - the modern `WebMessageListener` bridge is origin-scoped by Capacitor
+      and stays as is;
+    - only the exact registered callback is intercepted.
+  
+    Not detectable: if `addWebMessageListener` threw on a WebView that
+    supports it, Capacitor falls back to `androidBridge` as a Java object.
+    That object is still removed during sign-in, but is not restored
+    afterwards, so plugins would be unavailable until restart (the port's UI
+    uses no Capacitor plugins).
   - **Logout can't revoke server-side.** `/auth/logout` only revokes cookie
     sessions. Signing out clears the tokens on the device, but the refresh
     token stays valid on the gateway until it expires (30 days for basic
@@ -277,6 +297,189 @@ Run `npm run build` before every smoke: a stale `dist/` serves a blank page
 
 ## Verification
 
+### Round 17 (2026-10-23): round-16 review fixes (logout, native boundary, refresh ownership, timeouts, callback matcher)
+
+**1. Logout ends the signed-in client** (`bridge.ts` `oauthLogoutConnectionConfig`).
+- Before: storage was cleared, but the renderer's authenticated WebSockets
+  kept working (the reviewer's live `session.list` after logout succeeded),
+  and a refresh in flight could put the tokens back on the running client.
+- Now, in order:
+  1. `invalidateOauthSession()` bumps an auth epoch. A refresh that started
+     earlier can apply its result to no gateway object and no storage, and
+     its callers get "Signed out".
+  2. `/auth/logout` best-effort, with `keepalive` so it survives the unload.
+  3. Clear the stored and running credentials. localStorage is synchronous,
+     so this is persisted before step 4.
+  4. `pageLifecycle.reload()`, which tears down every authenticated socket.
+- `entry.ts` boots a signed-out gated gateway (no token) into the Gateway
+  screen with its URL and a "Signed out" note, not into a failing app.
+- **Live check** (`gated-signin-e2e.mjs`, routed `/api/ws`): every open
+  pre-logout socket closed on **both** page and server side, none reopened
+  with the old token, the stored token is cleared, the page reloaded into the
+  Gateway screen, and there were zero page errors.
+  - Playwright's `WebSocket.isClosed()` reports only 1 of 2 pre-logout
+    sockets closed across a document teardown, a false negative, so the
+    check uses Playwright's `routeWebSocket` (still connected to the real
+    server) as the source of truth.
+  - **Negative control:** with the reload removed, the e2e fails. This run
+    predates the summary-line fix: its first line still printed the static
+    text "reloaded into the Gateway screen", contradicted by the measured
+    `reload: false` below; it now prints the measured values.
+
+```
+sign-out: reloaded into the Gateway screen; stored token cleared; 0/1 open pre-logout sockets closed (page + server side); 0 reopened with the old token; 0 page errors across the reload [Playwright isClosed(): 1/2]
+GATED E2E FAILED:
+sign-out did not reload into the Gateway screen (reload: false, screen: false)
+1 authenticated socket(s) survived sign-out
+exit=1
+```
+
+**2. No callable native interface while a foreign document is in the main frame.**
+- Pinned Capacitor 8.5.3 adds Java objects with `addJavascriptInterface`,
+  which Android exposes to **every** origin:
+  - `androidBridge`, when `MessageHandler` falls back (no
+    `WEB_MESSAGE_LISTENER`, or the legacy bridge);
+  - `CapacitorHttpAndroidInterface` and `CapacitorCookiesAndroidInterface`,
+    always.
+- `MainActivity.GatewaySignInClient.begin()` removes all three, then loads
+  the authorize URL itself. A removal takes effect at that next load.
+- On the exact callback it re-adds them **before** loading the app origin
+  (an addition also appears at the next load):
+  - `androidBridge` only where Capacitor uses it as a Java object (the same
+    `WebViewFeature`/legacy test); the `MessageHandler` instance is read from
+    `Bridge.msgHandler` via reflection;
+  - the two plugin interfaces via `bridge.getPlugin(...).getInstance()`.
+- Back out of the login page: the app origin's `onPageStarted` re-adds them
+  and reloads once, so that app document has them.
+- The origin-scoped `WebMessageListener` path is untouched.
+- `app/build.gradle` adds `androidx.webkit` at Capacitor's own pinned version
+  (1.14.0); it was only a transitive `implementation` dependency of
+  Capacitor.
+- The RFC 8252 §8.12 deviation (embedded user agent) is documented under
+  "Gated gateways" as an accepted, mitigated trade-off.
+- **Not device-tested:** no APK was run on a device or emulator. Verified by
+  compiling against the pinned sources and by reading Capacitor's own code.
+
+**3. A shared refresh reaches every caller** (`oauth.ts` `refreshOauthTokens`).
+- One network refresh per refresh token, as before. That run now **persists
+  first** (guarded: only the stored copy of the same credential, and only if
+  not signed out since), then returns the outcome.
+- **Each** caller applies it to **its own** gateway object if that object
+  still holds the pre-refresh refresh token. That covers the booted gateway
+  and fresh `loadGateway()` copies alike.
+- An expired outcome clears every such caller.
+
+**4. Every OAuth exchange is bounded** (`oauth.ts` `exchangeJson`).
+- Code redemption and refresh share one 30 s deadline covering headers
+  **and** body. It races the abort itself, so even a reply that ignores the
+  signal can't hold the caller.
+- On a redemption timeout, boot proceeds to the Gateway screen with an
+  inline "timed out after 30s" error. The one-time code is never replayed.
+- A timed-out refresh releases its single-flight entry; the next 401 starts
+  a new one.
+
+**5. Exact native callback matcher.**
+- `OauthCallback.match` (pure Java) accepts only: scheme `http`, host
+  exactly `127.0.0.1`, no userinfo, port absent or 80, path exactly `/`, no
+  fragment, and both `code` and `state` present. That is exactly what
+  `oauth.ts` registers.
+- It is consulted **only while armed**. Sign-in mode is armed **only** by
+  `HermesOauthPlugin.beginSignIn`, which the app calls right after
+  persisting its pending record. A foreign `…/auth/native/authorize` no
+  longer arms anything.
+- Unarmed, the client defers everything to Capacitor.
+
+**Tests.**
+- `src/platform/oauth.test.ts`, 24. The 6 new ones:
+  - cross-object refresh → one refresh, both objects updated, both requests
+    fulfilled;
+  - an expired refresh clears both objects;
+  - logout during a held refresh → its late success is voided (request
+    rejected, no `Bearer access-2` ever sent, storage cleared, later
+    `api()` refused);
+  - a stalled code exchange → `failed` at 30 s, signal aborted, fetched
+    once, no gateway stored;
+  - a stalled refresh → request fails at 30 s, and the single-flight entry
+    is released (a second refresh issues a new request);
+  - a body that stalls after the headers → bounded.
+- The logout test now asserts the reload comes **after** the cleared state
+  is persisted.
+- `android/app/src/test/.../OauthCallbackTest.java` (JUnit, run with
+  `./gradlew :app:testDebugUnitTest`) checks the accepted shape and 14
+  rejected URLs: no state / no code, port 8123, path `/unrelated`, empty
+  path, https, `[::1]`, `localhost`, `127.0.0.2`, userinfo, fragment,
+  `127.0.0.1.evil.example`, garbage, null. Mutation check: dropping the
+  port condition fails it.
+- **The reviewer's own reproduction file** (`/tmp/hermes-r16-review-probe.test.ts`,
+  run temporarily as `src/platform/r16-review-probe.test.ts`, then removed).
+  Its four bug reproductions assert the buggy behaviour and now **fail**,
+  and its control passes:
+
+```
+ × reproduction: two objects sharing a refresh leave the second with obsolete credentials
+ × reproduction: a refresh completing after logout restores the active credential
+ × reproduction: code exchange remains pending for a minute without an abort signal
+ ✓ control: an expired pending sign-in is rejected before fetch
+ × reproduction: a refresh disregards the API request timeout
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 4 ⎯⎯⎯⎯⎯⎯⎯
+      Tests  4 failed | 1 passed (5)
+```
+
+**e2e corrections** (`scripts/gated-signin-e2e.mjs`):
+- REST must carry exactly `Bearer <saved access token>`, and the
+  session-token header is asserted absent per request.
+- The live WS must be `/api/ws` with `token` equal to the saved access
+  token.
+- Public routes are excluded prefix-aware (a gateway mounted under
+  `/hermes`).
+- Sign-out is checked as above.
+
+**Not changed (out of this round's scope):** pending-record hardening
+(finite `createdAt`, `baseUrl` type checks) from the review's "other areas"
+table. It is a local-storage-corruption robustness item, not a finding.
+
+**Gates** (final code, all exit 0):
+
+```
+npm run typecheck                                        → exit 0
+npm run build                                            → exit 0
+npx vitest run src/platform src/app/open-session.test.ts → exit 0
+  Test Files  5 passed (5)
+  Tests  84 passed (84)
+node --test scripts/smoke-classifier.test.mjs            → exit 0
+  # tests 8
+  # pass 8
+  # fail 0
+./gradlew :app:compileDebugJavaWithJavac :app:testDebugUnitTest (nix develop) → exit 0
+  OauthCallbackTest: tests=2 failures=0 (16 URL cases)
+node scripts/gated-signin-e2e.mjs … (gated gateway)      → exit 0, 3 consecutive runs
+node scripts/smoke.mjs … (token-mode rig)                → exit 0, 3 consecutive runs
+```
+
+Final gated e2e run, verbatim:
+
+```
+probe → gated, password provider: "Sign in" button shown
+gateway login page: /login
+  ws open, 20 frames received
+  ws closed after 297ms, 3 frames received
+loopback callback intercepted: yes; app URL cleaned: true
+saved gateway: authMode=oauth token=set refreshToken=set expiresAt=1792805189
+REST: 35 authed requests, 35 with exactly "Bearer <saved access token>" and no session-token header
+WebSocket: /api/ws open, receiving; token = saved access token: true
+sign-out: reloaded=true, Gateway screen=true; stored token cleared; 1/1 open pre-logout sockets closed (page + server side); 0 reopened with the old token; 0 page errors across the reload [Playwright isClosed(): 1/2]
+GATED E2E OK: native sign-in → connected with exact Bearer REST and token WebSocket → sign-out leaves no live socket
+exit=0
+```
+
+Final token-mode smoke run (tail, verbatim):
+
+```
+page errors: 0 (none tolerated)
+SMOKE OK: onboarding → connected chat surface (tablet + phone), thread-list switching works, zero page errors, zero bridge errors
+exit=0
+```
+
 ### Round 16 (2026-10-23): gated-gateway sign-in (basic_auth / OAuth)
 
 A gateway with dashboard auth runs **gated** (`auth_required`). It ignores
@@ -343,7 +546,12 @@ browser**, which would leave the app mid-sign-in. `GatewaySignInClient`
 - Everything else goes to Capacitor's default.
 - Capacitor injects its native bridge only into the app origin
   (`addDocumentStartJavaScript` with the allowed origins), so the gateway's
-  pages never see it.
+  pages never see it. *(Round 17 correction: wrong as a blanket claim. That
+  scopes the bootstrap script and the modern `WebMessageListener`, but Java
+  objects added with `addJavascriptInterface` — `androidBridge` on the
+  fallback path, and the always-registered `CapacitorHttpAndroidInterface` /
+  `CapacitorCookiesAndroidInterface` — are visible to every origin. Round 17
+  removes them for the duration of the sign-in.)*
 - Compiles: `nix develop --command ./gradlew :app:compileDebugJavaWithJavac`
   → exit 0. No APK was installed or run on a device or emulator this round.
 

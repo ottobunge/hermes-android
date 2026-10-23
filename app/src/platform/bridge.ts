@@ -35,7 +35,9 @@ import {
   tokenPreview
 } from './gateway-config'
 import { pickFiles, readBlobDataUrl, readBlobText, registerBlob, registerFile } from './local-files'
-import { ensureFreshOauthToken, startOauthLogin } from './oauth'
+import { Capacitor, registerPlugin } from '@capacitor/core'
+
+import { ensureFreshOauthToken, invalidateOauthSession, OAUTH_NOTICE_KEY, startOauthLogin } from './oauth'
 
 type Bridge = Window['hermesDesktop']
 
@@ -308,9 +310,17 @@ async function testAndReload(gateway: SavedGateway) {
 }
 
 /** Page lifecycle seam (jsdom's location.reload can't be spied on). */
+// Android: MainActivity's HermesOauthPlugin. Native starts the sign-in itself
+// (detaching every native JS interface, then loading the authorize URL), and
+// only this call can put the WebView into sign-in mode — never a foreign page.
+const HermesOauth = registerPlugin<{ beginSignIn(options: { url: string }): Promise<void> }>('HermesOauth')
+
 export const pageLifecycle = {
   reload: () => window.location.reload(),
-  navigate: (url: string) => window.location.assign(url)
+  navigate: (url: string) => window.location.assign(url),
+  // A desktop browser (npm run dev/preview, the e2e) has no native shell.
+  beginSignIn: (url: string): Promise<void> | void =>
+    Capacitor.isNativePlatform() ? HermesOauth.beginSignIn({ url }) : pageLifecycle.navigate(url)
 }
 
 function applyAndReload(gateway: SavedGateway) {
@@ -476,39 +486,53 @@ export const bridge: Bridge = {
   // deliberately NEVER settles: the page unloads, and the panel keeps its
   // "signing in" state until then instead of flashing an "incomplete" warning.
   oauthLoginConnectionConfig: async remoteUrl => {
-    await startOauthLogin(remoteUrl, pageLifecycle.navigate)
+    await startOauthLogin(remoteUrl, pageLifecycle.beginSignIn)
 
     return new Promise(() => {})
   },
-  // Clears the sign-in locally (stored copy and the running page's). The
-  // gateway's /auth/logout revokes only cookie sessions; it is still told,
-  // best effort, but a Bearer client's refresh token stays valid server-side
-  // until it expires (README "Gated gateways").
+  // Sign-out ends the signed-in client, not just the saved credential:
+  //   1. void any in-flight refresh (a late result must not re-arm a token);
+  //   2. tell the gateway, best effort (keepalive survives the unload). Its
+  //      /auth/logout revokes cookie sessions only, so the refresh token stays
+  //      valid server-side until it expires (README "Gated gateways");
+  //   3. clear the stored and running credentials — localStorage writes are
+  //      synchronous, so they are persisted before the next step;
+  //   4. reload the page: every authenticated WebSocket dies with it. The
+  //      signed-out gateway then boots into the Gateway screen (entry.ts).
   oauthLogoutConnectionConfig: async remoteUrl => {
     const baseUrl = normalizeRemoteBaseUrl(remoteUrl)
     const stored = loadGateway()
     const booted = bootGateway()
+    const matches = (gateway: SavedGateway | null): gateway is SavedGateway =>
+      gateway?.authMode === 'oauth' && normalizeRemoteBaseUrl(gateway.httpUrl) === baseUrl
+    const token = [stored, booted].find(gateway => matches(gateway) && gateway.token)?.token
 
-    for (const gateway of [stored, booted]) {
-      if (gateway?.authMode === 'oauth' && gateway.token && normalizeRemoteBaseUrl(gateway.httpUrl) === baseUrl) {
-        void fetch(`${baseUrl}/auth/logout`, {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${gateway.token}` },
-          redirect: 'manual'
-        }).catch(() => {})
-        break
-      }
+    invalidateOauthSession()
+
+    if (token) {
+      void fetch(`${baseUrl}/auth/logout`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        redirect: 'manual',
+        keepalive: true
+      }).catch(() => {})
     }
 
     for (const gateway of [stored, booted]) {
-      if (gateway?.authMode === 'oauth' && normalizeRemoteBaseUrl(gateway.httpUrl) === baseUrl) {
+      if (matches(gateway)) {
         Object.assign(gateway, { token: undefined, refreshToken: undefined, tokenExpiresAt: undefined })
       }
     }
 
-    if (stored?.authMode === 'oauth' && normalizeRemoteBaseUrl(stored.httpUrl) === baseUrl) {
+    if (matches(stored)) {
       saveGateway(stored)
+      sessionStorage.setItem(
+        OAUTH_NOTICE_KEY,
+        JSON.stringify({ kind: 'cancelled', message: `Signed out of ${hostLabel(baseUrl)}.` })
+      )
     }
+
+    setTimeout(() => pageLifecycle.reload())
 
     return { ok: true, connected: false }
   },
