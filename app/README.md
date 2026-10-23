@@ -27,7 +27,10 @@ Android-specific lives in `src/platform/` (each file is headed
 "Android adaptation layer"), plus `index.html` → `src/platform/entry.ts`,
 `vite.config.ts` (including an alias that resolves the vendored stylesheet's
 monorepo-relative `../../../node_modules/…` font URLs from `app/node_modules`),
-`vitest.config.ts`, `capacitor.config.ts`.
+`vitest.config.ts`, `capacitor.config.ts`. One dependency is patched on
+purpose: `patches/@assistant-ui+core+0.2.23.patch`, applied by
+`patch-package` on `postinstall`. It fixes the upstream render loop; see
+"Fixed: assistant-ui thread-list render loop" below.
 
 ## How it works
 
@@ -181,38 +184,16 @@ state.
   640px the drawer has no swipe gesture: open and close it with the titlebar
   toggle or a tap outside. No bottom nav. Overlay views stay overlays (cards
   over the app with a titlebar-height top inset), not full-screen routes.
-- **Typing into the composer can crash the main "workspace" pane: confirmed
-  upstream behavior, not a port defect.**
-  - Typing makes `@assistant-ui/tap` throw a second guard, "Maximum update
-    depth exceeded. This can happen when a resource repeatedly calls
-    setState inside useEffect." (`UpdateScheduler.markDirty`), alongside
-    more getSnapshot-guard errors.
-  - Intermittently, a getSnapshot error escapes into the workspace pane's
-    error boundary: "“workspace” failed to render … getSnapshot should be
-    cached", with a Retry button. The composer text itself is accepted.
-  - Reproduced on 2026-10-23, at both 390 and 1280px, so not phone-specific:
-    - **port:** 3/6 runs that typed right after boot crashed, 0/2 that waited
-      ~8 s; in one smoke run it also crashed later, while the drawer was
-      open, after typing had already settled;
-    - **unmodified upstream Electron** (round-4 harness, real preload, same
-      scratch gateway): **3/4** runs that typed right after boot crashed,
-      with the same 2× markDirty + getSnapshot errors.
-  - Not fixed: the fix belongs in the upstream thread-list store / tap
-    usage, not in the Android layer. The smoke therefore doesn't type (see
-    "Smoke"), and it fails if the workspace ever shows the error boundary.
-- **Render-loop errors on every page: the original loop is confirmed
-  upstream behavior, not a port defect.** Each boot throws several (4–9 observed) uncaught `Maximum update depth exceeded.
-  The result of getSnapshot should be cached…` errors at every width. Traced
-  in a dev build: the loop is assistant-ui's thread-list store
-  (`@assistant-ui/core` `ThreadListRuntimeImpl` state via `@assistant-ui/tap`'s
-  `useSyncExternalStore`). Each commit re-notifies it and it hands back a
-  fresh object whose fields are all `===` the previous ones, so tap's
-  50-commit guard throws. The app still renders and works afterwards. See
-  "Upstream comparison" below for the Electron reproduction. The smoke
-  tolerates only errors thrown by tap's guard itself (exact message, top
-  frame exactly at the guard's `file:line:column` in this build, connected
-  phase, bounded count), and fails on anything else. See "Smoke"
-  for what that does and doesn't establish.
+- **Fixed: assistant-ui thread-list render loop (deliberate divergence from
+  upstream).** Upstream, every connected page threw several uncaught
+  `Maximum update depth exceeded. The result of getSnapshot should be
+  cached…` errors. Typing added `… a resource repeatedly calls setState
+  inside useEffect.` errors, and the loop could knock the main workspace
+  pane into its "failed to render" error boundary, during session switches
+  or typing. All of it reproduced in the unmodified upstream Electron app.
+  The port carries a one-line `patch-package` fix to `@assistant-ui/core`,
+  and the smoke now tolerates **no** page errors. Root cause, fix and
+  evidence are under "Verification → Render-loop fix".
 - **`app/android/` does not exist.** `npx cap add android` / `npx cap sync
   android` were not run, so the native project is not committed yet.
 - **No Android SDK/JDK on this machine** (`java`, `sdkmanager`, `adb` absent,
@@ -227,10 +208,10 @@ Requires Node 22+.
 
 ```sh
 cd app
-npm install
+npm install                # postinstall: patch-package applies patches/
 npm run typecheck          # tsc -p . --noEmit
 npm test                   # vitest run (full suite is slow: ~1000 files)
-npx vitest run src/platform  # bridge checks only
+npx vitest run src/platform  # bridge checks + the assistant-ui patch check
 node --test scripts/smoke-classifier.test.mjs  # smoke page-error classifier
 npm run build              # vite build → dist/
 npm run dev                # http://127.0.0.1:5174 (browser dev against a gateway)
@@ -261,42 +242,130 @@ A scratch gateway that doesn't touch an existing one:
 export HERMES_HOME=$(mktemp -d) HERMES_DASHBOARD_SESSION_TOKEN=$(openssl rand -hex 24)
 hermes serve --port 19719 --skip-build &   # REST + /api/ws
 hermes gateway run &                       # initializes state.db (else /api/sessions → 503)
+# the two sessions the smoke switches between (synthetic transcripts)
+for f in scripts/smoke-sessions/alpha.jsonl scripts/smoke-sessions/beta.jsonl; do
+  hermes sessions import --from claude "$f"
+done
+hermes sessions list                       # then rename the two imported ids:
+hermes sessions rename <alpha-id> "Smoke alpha"
+hermes sessions rename <beta-id>  "Smoke beta"
 ```
+
+Run `npm run build` before every smoke: a stale `dist/` serves a blank page
+(round 9).
 
 ## Verification
 
-Round 9 (2026-10-23, phone layout polish + first-run overlay diagnosis).
-Gates run in this order, all exit 0:
+Round 10 (2026-10-23, assistant-ui render-loop fix). Gates run in this
+order, all exit 0:
 
 ```
 npm run typecheck                               → exit 0
 npm run build                                   → exit 0
 npx vitest run src/platform                     → exit 0
-  Test Files  1 passed (1)
-  Tests  18 passed (18)
+  Test Files  2 passed (2)
+  Tests  20 passed (20)
 node --test scripts/smoke-classifier.test.mjs   → exit 0
-  ok 1 - findGuardSite locates the single guard Error( in the built assets
-  ok 2 - findGuardSite reports `new Error(` at `new`
-  ok 3 - findGuardSite fails closed on zero or several candidates
-  ok 4 - baseline-shaped errors at the guard site within the bound are tolerated
-  ok 5 - same message, same capabilities chunk, different function/location fails
-  ok 6 - the same message from an unrelated stack fails
-  ok 7 - a guard frame below an unrelated top frame still fails
-  ok 8 - no identified guard site means no allowance
-  ok 9 - more than the bound fails
-  ok 10 - onboarding gets no allowance
-  ok 11 - any other message fails
-  # tests 11
-  # pass 11
+  ok 1 - no page errors → no problems
+  ok 2 - the formerly tolerated getSnapshot loop now fails, in every phase
+  ok 3 - a single occurrence fails — there is no count allowance
+  ok 4 - the markDirty variant (typing) fails as a render-loop regression
+  ok 5 - every error is reported, one problem each, other errors as plain pageerrors
+  # tests 5
+  # pass 5
   # fail 0
-node scripts/smoke.mjs …                        → exit 0, three consecutive runs (output below)
+node scripts/smoke.mjs …                        → exit 0, four runs, 0 page errors each (output below)
 ```
+
+### Render-loop fix (round 10)
+
+**Root cause, traced in this build:**
+1. `@assistant-ui/core`'s `ThreadListRuntimeImpl` wraps its state in a
+   `LazyMemoizeSubject` (`stateBinding`, binding `getThreadListState(core)`,
+   which builds a **new** wrapper object on every call). But
+   `ThreadListRuntimeImpl.subscribe()` forwards straight to
+   `this._core.subscribe()`, **never to `stateBinding`**.
+2. So the subject never gets a subscriber. `isConnected` stays `false`, and
+   `LazyMemoizeSubject.getState()` takes its `!this.isConnected` branch on
+   **every read**, returning a fresh object whose fields are all `===` the
+   previous ones.
+3. `ThreadListRuntimeClient` reads it via `useSubscribable(runtime)`, which
+   is `@assistant-ui/tap`'s `useSyncExternalStore(runtime.subscribe,
+   runtime.getState)`. Tap's post-commit check compares the render-time
+   snapshot with a fresh `getSnapshot()`. Their identities always differ, so
+   it forces another commit. After 50 commits its guard throws "Maximum
+   update depth exceeded. The result of getSnapshot should be cached…".
+4. The composer runtime uses the same `LazyMemoizeSubject` and showed the
+   same pattern while typing: tap's `UpdateScheduler.markDirty` guard.
+
+Instrumented dev build, 90 s on the connected chat surface: the thread-list
+subject received **0** change notifications, and **23** shallow-equal
+rebuilds were swallowed by the fix. So this was never "re-notifying every
+commit", as rounds 2–9 described it; the subject was simply never
+connected.
+
+**Fix:** `patches/@assistant-ui+core+0.2.23.patch`, a one-line change in
+`dist/subscribable/subscribable.js`.
+`LazyMemoizeSubject.getState()` now keeps its previous snapshot when the
+rebuilt one is shallow-equal: `if (newState !== SKIP_UPDATE &&
+!shallowEqual(newState, this._previousState)) this._previousState =
+newState;`. That is the rule its sibling `ShallowMemoizeSubject` already
+uses. Real changes give a field a new identity, so they still produce a new
+snapshot. The patch is applied by `patch-package` (devDependency, exact pin
+8.0.1) on `postinstall`. A clean reinstall of `@assistant-ui/core` re-applied
+it: `@assistant-ui/core@0.2.23 ✔`. The other possible fix, subscribing
+`ThreadListRuntimeImpl.subscribe` through `stateBinding`, is left for an
+upstream issue (`npx patch-package @assistant-ui/core --create-issue`).
+
+**Evidence:**
+- **Unit:** `src/platform/assistant-ui-patch.test.ts` checks that a
+  disconnected subject returns the same snapshot for unchanged state, and
+  still a new one when a field changes (disconnected and connected). Against
+  the unpatched file, the stability test fails (1 failed | 1 passed).
+- **Production build, before → after, 1280 and 390px:**
+  - boot + typing: 6–11 getSnapshot + 1–4 markDirty page errors → **0**;
+  - typing right after boot (which crashed the workspace in 3/6 runs
+    before): **0/6 crashes, 0 errors**.
+- **Thread list still updates:** the smoke switches Smoke alpha → Smoke
+  beta → Smoke alpha at 1280px (sidebar) and 390px (drawer). Each switch
+  must render that session's transcript and not the other's. Both widths
+  pass with 0 page errors.
+- **Negative control:** the same smoke against a build **without** the patch
+  exits 1. During the 1280px session switches the workspace fell into its
+  error boundary and the composer never came back (excerpt, stacks omitted):
+
+```
+screenshot: /tmp/smoke-out-np/1-onboarding.png
+[tablet] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+[tablet] first-run overlay: provider picker after 2.4s (gateway has no model provider) → skipped
+[tablet] console.error: Error: Maximum update depth exceeded. The result of getSnapshot should be cached to avoid an infinite loop.
+[tablet] console.error: [error-boundary:contrib:workspace] Error: Maximum update depth exceeded. The result of getSnapshot should be cached to avoid an infinite loop.
+[tablet] thread list: switched Smoke alpha → Smoke beta → Smoke alpha, transcripts followed
+screenshot: /tmp/smoke-out-np/2-connected-1280.png
+locator.waitFor: Timeout 45000ms exceeded.
+  - waiting for locator('[contenteditable="true"], textarea').first() to be visible
+exit=1
+```
+
+- **No tolerance remains.** `scripts/smoke-classifier.mjs` reports every page
+  error as a problem. "Maximum update depth exceeded …" is labelled a
+  render-loop regression of the patch. The guard-site scan, count bounds and
+  phase allowances of rounds 3–9 are gone, and the classifier tests now
+  assert that the formerly tolerated shape fails.
+
+**Phone drawer fix found by the new switching check.** Tapping the session
+that was already open didn't change the URL, so the drawer stayed open (the
+"same-URL selection" gap noted in round 1). `phone-layout.ts` now also
+closes the drawer when a tap selects a session row
+(`[data-slot="row-button"]`) or nav item (`[data-sidebar="menu-button"]`).
+The smoke's phone sequence starts by tapping the already-open session.
+
+### Earlier verification notes
 
 - **`dist/` was stale at the start of round 9.** `dist/index.html` referenced
   an `index-*.js` the build directory no longer contained, so the preview's
   HTML fallback answered `200 text/html` for it and the page stayed blank.
-  It was rebuilt before every measurement; `npm run build` before a smoke is
-  mandatory.
+  Always run `npm run build` before a smoke.
 
 - **`bridge.test.ts` (18 tests).** Beyond URL/transport mapping it covers:
   - cross-host blank-token refusal on both save paths;
@@ -340,120 +409,63 @@ the viewport outside the drawer. Each screenshot was also reviewed by eye.
 The "Search Ctrl K" pill straddling the top edge of overlay cards is
 upstream's design (also at desktop widths) and was left alone.
 
-### Smoke: executed, PASSED (bounded render-loop errors at the guard site tolerated)
+### Smoke: executed, PASSED (zero page errors, none tolerated)
 
 Scratch gateway (`hermes serve --port 19719` + `hermes gateway run`,
-throwaway `HERMES_HOME`, no model provider), production build on `vite
-preview`, headless Chromium 155. The smoke:
+throwaway `HERMES_HOME`, no model provider, the two seeded smoke sessions),
+production build on `vite preview`, headless Chromium 155. The smoke:
 - attaches one listener per page;
 - asserts the connected surface at 1280 **and** 820px;
 - checks that the Collapse font loads and that a `<webview>` reports
   "unavailable";
 - waits for the first-run overlay to settle, and fails if it's still
   "Starting Hermes…" after 30 s;
+- **switches sessions** Smoke alpha → Smoke beta → Smoke alpha in the
+  1280px sidebar. Each session's own transcript must render and the other's
+  must not be visible;
 - at 820px, checks that overlay views keep upstream's ≥ 40px side gutters
   (the phone CSS must not leak to tablet);
 - runs the phone checks:
-  - the composer is on screen, editable and focusable by tap. It
-    deliberately does **not** type, because typing intermittently crashes
-    the workspace through the upstream loop (see "Deviations");
+  - the composer is on screen and takes typed text (not sent);
+  - the same session switching through the drawer, which must close after
+    each selection, including the already-open session;
   - the drawer opens and closes;
   - Settings opens from the titlebar with a card within 24px of the viewport
     width;
   - Capabilities opens from the drawer, which closes on that navigation;
   - onboarding (no gateway) has its URL field and Save on the first screen;
-  - no horizontal overflow on chat, settings, capabilities and onboarding;
-- fails whenever an error boundary shows "… failed to render", at 1280px
-  and twice on phone.
+  - no horizontal overflow on chat, the session transcript, settings,
+    capabilities and onboarding;
+- fails whenever an error boundary shows "… failed to render";
+- **fails on any uncaught page error**, via `scripts/smoke-classifier.mjs`.
 
-**Guard site, derived from the build.** Before launching the browser, the
-smoke scans the served build's JS assets (`--dist`, default `dist/`) for the
-`@assistant-ui/tap` `useSyncExternalStore` guard's throw expression:
-`Error(…)` or `new Error(…)` with the exact guard message. It requires
-**exactly one** occurrence and records its `file:line:column`, the position
-V8 reports for that frame. Node confirms V8 reports `Error(` at `Error` and
-`new Error(` at `new`.
-- In this build there is one: **`capabilities-B1fqOH3C.js:4:1991`**, the
-  `Error(` in `if(++o.current>50)throw o.current=0,Error(...)`. That is
-  exactly the top frame of every observed baseline error.
-- No source maps are emitted, so the site comes from the minified asset, not
-  from a source-mapped origin.
-- Zero or several candidates means **no allowance**: every page error fails
-  (fail closed). A served guard frame whose filename or coordinates differ
-  from the scanned site is rejected.
-
-Page errors are judged by `scripts/smoke-classifier.mjs`. An error is
-tolerated only if **all** of these hold, and anything else fails the run:
-- the message is exactly the guard message;
-- the **top stack frame is exactly the guard site** (`file:line:column`), not
-  merely somewhere in the same chunk;
-- it happens in a connected phase (`tablet`/`phone`). **Onboarding gets no
-  allowance.** The phase switches to `tablet` on the main-frame navigation
-  that "Save and reconnect" triggers;
-- the phase's count is at most **21**, which is 3x the typical baseline of 7
-  per phase. Observed counts: 6–7 here, 8–9 in a reviewer's run, 5 in
-  upstream Electron.
-
-**What this establishes, and what it doesn't.**
-- The upstream Electron comparison shows the original loop is upstream
-  behavior.
-- The classifier establishes that each tolerated error was **thrown by tap's
-  `useSyncExternalStore` guard itself**, with that exact message, on the
-  connected surface, within the bound.
-- It does **not** identify which tap resource looped. The guard is shared by
-  every tap resource using that hook, so a *different* resource looping
-  through the same guard, within the bound, would also pass.
-- It rejects:
-  - the same message thrown from any other location, including other code
-    in the same `capabilities-*` chunk;
-  - errors whose top frame is elsewhere, even with the guard frame further
-    down the stack;
-  - onboarding errors and counts above the bound;
-  - everything when no unique guard site is found.
-
-  `scripts/smoke-classifier.test.mjs` covers each case. That includes the
-  reviewers' scenario: same message, same chunk, different function/location
-  (`capabilities-B1fqOH3C.js:32:127`, off-by-one columns, the right location
-  in a different file).
-
-Output of the third consecutive round-9 run, verbatim (token redacted; runs 1 and 2 also exited 0):
+Final run on the final build, verbatim (token redacted; three earlier runs
+on the same code also exited 0 with `page errors: 0`):
 
 ```
-render-loop guard site: capabilities-B1fqOH3C.js:4:1991
 screenshot: /tmp/smoke-out/1-onboarding.png
 [tablet] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
-[tablet] first-run overlay: provider picker after 2.2s (gateway has no model provider) → skipped
+[tablet] first-run overlay: provider picker after 3.1s (gateway has no model provider) → skipped
+[tablet] thread list: switched Smoke alpha → Smoke beta → Smoke alpha, transcripts followed
 screenshot: /tmp/smoke-out/2-connected-1280.png
 screenshot: /tmp/smoke-out/3-connected-tablet-820.png
 [phone] first-run overlay: none (provider configured or previously skipped)
 screenshot: /tmp/smoke-out/4-connected-phone-390.png
 [phone] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+[phone] thread list: switched Smoke alpha → Smoke beta → Smoke alpha, transcripts followed
 screenshot: /tmp/smoke-out/5-phone-drawer-open.png
 screenshot: /tmp/smoke-out/6-phone-settings.png
 screenshot: /tmp/smoke-out/7-phone-capabilities.png
 screenshot: /tmp/smoke-out/8-phone-onboarding.png
-[tablet] baseline-shaped render-loop pageerror ×8 (tolerated, bound 21): guard message, top frame exactly at the guard site
-[phone] baseline-shaped render-loop pageerror ×9 (tolerated, bound 21): guard message, top frame exactly at the guard site
-SMOKE OK: onboarding → connected chat surface (tablet + phone), page errors limited to the bounded baseline render-loop shape, zero bridge errors
+page errors: 0 (none tolerated)
+SMOKE OK: onboarding → connected chat surface (tablet + phone), thread-list switching works, zero page errors, zero bridge errors
 exit=0
 ```
 
-**Fail-closed check, real browser (round 7).** The same smoke against the same server,
-with `--dist` pointed at an empty directory so no guard site can be found
-(excerpt, token redacted):
-
-```
-render-loop guard site: NOT identified in this build — no page error will be tolerated
-SMOKE FAILED:
-[tablet] pageerror: Maximum update depth exceeded. The result of getSnapshot should be cached to avoid an infinite loop. [no guard site identified in this build: no allowance]
-    at http://127.0.0.1:4174/assets/capabilities-B1fqOH3C.js:4:1991
-[tablet] pageerror: Maximum update depth exceeded. The result of getSnapshot should be cached to avoid an infinite loop. [no guard site identified in this build: no allowance]
-    at http://127.0.0.1:4174/assets/capabilities-B1fqOH3C.js:4:1991
-    … (12 errors, all rejected)
-exit=1
-```
-
 Earlier rounds (kept for history):
+- Rounds 3–9 tolerated the render-loop error by message, then by build-derived
+  guard site, phase and count bound. Round 10 fixed the loop and removed all
+  tolerance.
 - Round 6's classifier accepted a top frame anywhere in the ~534 KB
   `capabilities-*.js` chunk. Reviewers showed that an unrelated same-message
   throw elsewhere in that chunk passed; round 7 pins it to the guard site.
@@ -539,5 +551,11 @@ gateway.
   upstream's (`diff -rq` differs only by `src/platform/`), the dependency
   versions are identical, and the error reproduces with upstream's own bridge.
   So it is not caused by the Android bridge, the entry order or dependency
-  resolution. It's upstream behavior, and no port change was made.
+  resolution. It's upstream behavior. **Round 10 fixed it in the port**
+  with the `@assistant-ui/core` patch ("Render-loop fix"), deliberately
+  diverging from upstream.
+- **Round 9 addition:** typing in the same Electron harness crashed the
+  workspace pane ("“workspace” failed to render") in 3/4 runs that typed
+  right after boot, alongside 2× markDirty + getSnapshot errors per typing
+  burst. Also fixed by the round-10 patch.
 

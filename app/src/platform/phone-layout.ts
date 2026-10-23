@@ -10,8 +10,10 @@
 //   2. the "HERMES AGENT" wordmark may shrink below its 2.75rem floor rather
 //      than clip;
 //   3. the statusbar scrolls sideways instead of clipping;
-//   4. the drawer closes on a tap outside it, or when a tap inside navigates
-//      (the hover-out dismissal never fires on touch);
+//   4. the drawer closes on a tap outside it, when a tap inside navigates, or
+//      when a tap selects a session row / nav item — even the one already
+//      showing, which doesn't change the URL (the hover-out dismissal never
+//      fires on touch);
 //   5. overlay views (Settings, Scheduled jobs, …) keep their titlebar-height
 //      top inset but drop the ~44px side/bottom gutters, which left a 300px
 //      card on a 390px screen;
@@ -52,22 +54,29 @@ function closeDrawer(overlay: Element) {
   }
 }
 
-// URL when a press inside the drawer began; one delegated click handler
-// compares it after the click, so nothing is attached per gesture.
+// Session rows and nav items: selecting one hands the screen back.
+const SELECT_TARGETS = '[data-slot="row-button"], [data-sidebar="menu-button"]'
+
+// URL when a press inside the drawer began (and whether it pressed a
+// selectable row); one delegated click handler acts after the click, so
+// nothing is attached per gesture.
 let hrefAtPress: null | string = null
+let pressedRow = false
 
 function onPointerDown(event: PointerEvent) {
   const overlay = document.querySelector('[data-narrow-overlay]')
   const target = event.target as Element | null
   hrefAtPress = null
+  pressedRow = false
 
   if (!overlay || !target || !window.matchMedia(SIDEBAR_COLLAPSE_MEDIA_QUERY).matches) {
     return
   }
 
   if (overlay.contains(target)) {
-    // A tap that navigates (session row, nav item) hands the screen back.
+    // A tap that navigates or selects a row hands the screen back.
     hrefAtPress = location.href
+    pressedRow = Boolean(target.closest(SELECT_TARGETS))
 
     return
   }
@@ -83,7 +92,9 @@ function onPointerDown(event: PointerEvent) {
 
 function onClick() {
   const before = hrefAtPress
+  const row = pressedRow
   hrefAtPress = null
+  pressedRow = false
 
   if (before === null) {
     return
@@ -92,7 +103,7 @@ function onClick() {
   setTimeout(() => {
     const overlay = document.querySelector('[data-narrow-overlay]')
 
-    if (overlay && location.href !== before) {
+    if (overlay && (row || location.href !== before)) {
       closeDrawer(overlay)
     }
   })
@@ -104,6 +115,13 @@ export function installPhoneLayout(): void {
   style.textContent = PHONE_CSS
   document.head.appendChild(style)
   document.addEventListener('pointerdown', onPointerDown, true)
-  document.addEventListener('pointercancel', () => (hrefAtPress = null), true)
+  document.addEventListener(
+    'pointercancel',
+    () => {
+      hrefAtPress = null
+      pressedRow = false
+    },
+    true
+  )
   document.addEventListener('click', onClick, true)
 }

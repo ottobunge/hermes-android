@@ -1,0 +1,19 @@
+diff --git a/node_modules/@assistant-ui/core/dist/subscribable/subscribable.js b/node_modules/@assistant-ui/core/dist/subscribable/subscribable.js
+index 906ccca..9b0123a 100644
+--- a/node_modules/@assistant-ui/core/dist/subscribable/subscribable.js
++++ b/node_modules/@assistant-ui/core/dist/subscribable/subscribable.js
+@@ -118,7 +118,13 @@ var LazyMemoizeSubject = class extends BaseSubject {
+ 	getState = () => {
+ 		if (!this.isConnected || this._previousStateDirty) {
+ 			const newState = this.binding.getState();
+-			if (newState !== SKIP_UPDATE) this._previousState = newState;
++			// hermes-android patch: keep the previous snapshot when the rebuilt one
++			// is shallow-equal (as ShallowMemoizeSubject does). ThreadListRuntimeImpl
++			// subscribes callers to its core, never to this subject, so the subject
++			// stays disconnected and rebuilt a new object on EVERY read — tap's
++			// useSyncExternalStore then never saw a stable snapshot and threw
++			// "Maximum update depth exceeded … getSnapshot should be cached".
++			if (newState !== SKIP_UPDATE && !shallowEqual(newState, this._previousState)) this._previousState = newState;
+ 			this._previousStateDirty = false;
+ 		}
+ 		if (this._previousState === void 0) throw new Error("Entry not available in the store");

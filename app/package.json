@@ -11,6 +11,7 @@
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1 --port 4174",
     "typecheck": "tsc -p . --noEmit",
+    "postinstall": "patch-package",
     "test": "vitest run",
     "cap:sync": "cap sync android",
     "android:debug": "npm run build && cap sync android && cd android && ./gradlew assembleDebug"
@@ -108,6 +109,7 @@
     "babel-plugin-react-compiler": "1.0.0",
     "bippy": "0.5.43",
     "jsdom": "29.1.1",
+    "patch-package": "8.0.1",
     "playwright-core": "1.62.1",
     "typescript": "6.0.3",
     "vite": "8.2.0",

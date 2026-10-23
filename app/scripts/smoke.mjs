@@ -1,9 +1,14 @@
 // Boot smoke: serve dist/ (vite preview), then in headless Chromium:
 //   1. fresh profile → onboarding (the reused Settings → Gateway panel)
 //   2. fill URL + token through that UI → "Save and reconnect" → reload
-//   3. connected app renders (sidebar + composer) at tablet and phone widths
-// Fails on any uncaught page error, `hermesDesktop.* is not a function`, or a
-// missing surface. Screenshots land in --out.
+//   3. connected app renders (sidebar + composer) at tablet and phone widths,
+//      and the thread list switches between the two seeded sessions
+// Fails on ANY uncaught page error (none is tolerated), `hermesDesktop.* is
+// not a function`, or a missing surface. Screenshots land in --out.
+//
+// The gateway must hold the two smoke sessions (README "Boot smoke":
+// `hermes sessions import` of scripts/smoke-sessions/*.jsonl, renamed
+// "Smoke alpha" / "Smoke beta").
 //
 // usage: node scripts/smoke.mjs --app http://127.0.0.1:4174 --gateway http://127.0.0.1:19719 \
 //          --token <token> --chromium /path/to/chromium --out smoke-out
@@ -13,7 +18,7 @@ import { parseArgs } from 'node:util'
 
 import { chromium } from 'playwright-core'
 
-import { classifyPageErrors, findGuardSite, KNOWN_LOOP_LIMIT_PER_PHASE } from './smoke-classifier.mjs'
+import { classifyPageErrors } from './smoke-classifier.mjs'
 
 const { values: args } = parseArgs({
   options: {
@@ -21,9 +26,7 @@ const { values: args } = parseArgs({
     gateway: { type: 'string' },
     token: { type: 'string' },
     chromium: { type: 'string', default: process.env.CHROMIUM_PATH },
-    out: { type: 'string', default: 'smoke-out' },
-    // The build being served (for locating the render-loop guard site).
-    dist: { type: 'string', default: 'dist' }
+    out: { type: 'string', default: 'smoke-out' }
   }
 })
 
@@ -32,21 +35,6 @@ if (!args.gateway || !args.token) {
 }
 
 fs.mkdirSync(args.out, { recursive: true })
-
-// Where THIS build's tap render-loop guard throws (fail closed: null → no
-// allowance). A served guard frame whose filename or coordinates differ from
-// the scanned site is rejected.
-const assetsDir = path.join(args.dist, 'assets')
-const guardSite = findGuardSite(
-  (fs.existsSync(assetsDir) ? fs.readdirSync(assetsDir) : [])
-    .filter(name => name.endsWith('.js'))
-    .map(name => ({ name, source: fs.readFileSync(path.join(assetsDir, name), 'utf8') }))
-)
-console.log(
-  guardSite
-    ? `render-loop guard site: ${guardSite.file}:${guardSite.line}:${guardSite.column}`
-    : 'render-loop guard site: NOT identified in this build — no page error will be tolerated'
-)
 
 const problems = []
 const pageErrors = []
@@ -113,10 +101,9 @@ async function assertConnected(p, label) {
   }
 }
 
-// The upstream render loop can escape into the "workspace" pane's error
-// boundary ("“workspace” failed to render") — reproduced in upstream Electron
-// after typing into the composer (README "Deviations"). A crashed main
-// surface always fails the run.
+// Before the assistant-ui patch, the render loop could escape into the
+// "workspace" pane's error boundary ("“workspace” failed to render"),
+// especially after typing. A crashed main surface always fails the run.
 async function assertWorkspaceAlive(p, label) {
   if (await p.getByText(/failed to render/).count()) {
     problems.push(`[${label}] an error boundary is showing ("… failed to render") — the main surface crashed`)
@@ -157,6 +144,57 @@ async function settleFirstRun(p, label) {
 }
 
 await settleFirstRun(page, 'tablet')
+await assertWorkspaceAlive(page, 'tablet')
+
+// Thread-list interactivity: the patched assistant-ui snapshot must still
+// carry thread switches. Switch alpha → beta → alpha and require each
+// session's own transcript (and not the other's) to render.
+const SMOKE_SESSIONS = [
+  ['Smoke alpha', 'Alpha answer: 4.'],
+  ['Smoke beta', 'Beta answer: blue.']
+]
+
+async function switchSessions(p, label, viaDrawer) {
+  for (const [title, answer] of [...SMOKE_SESSIONS, SMOKE_SESSIONS[0]]) {
+    if (viaDrawer) {
+      await p.getByRole('button', { name: /show sidebar|hide sidebar/i }).first().tap({ timeout: 15_000 })
+      await p.locator('[data-narrow-overlay] [data-slot="sidebar"]').waitFor({ timeout: 15_000 })
+    }
+
+    // Scoped to the thread list itself: the title also appears elsewhere
+    // (e.g. a hidden chat header), which must not satisfy the lookup.
+    const row = p
+      .locator(viaDrawer ? '[data-narrow-overlay]' : '[data-slot="sidebar"]')
+      .getByText(title, { exact: true })
+      .first()
+
+    if (!(await row.waitFor({ timeout: 15_000 }).then(() => true, () => false))) {
+      problems.push(`[${label}] session "${title}" is not in the thread list — seed the gateway (README "Boot smoke")`)
+
+      return
+    }
+
+    await (viaDrawer ? row.tap() : row.click())
+
+    if (!(await p.getByText(answer).first().waitFor({ timeout: 15_000 }).then(() => true, () => false))) {
+      problems.push(`[${label}] switching to "${title}" did not render its transcript`)
+    }
+
+    const other = SMOKE_SESSIONS.find(([t]) => t !== title)[1]
+
+    if (await p.locator(`text=${other} >> visible=true`).count()) {
+      problems.push(`[${label}] "${title}" still shows the other session's transcript`)
+    }
+
+    if (viaDrawer && !(await p.locator('[data-narrow-overlay]').waitFor({ state: 'detached', timeout: 5_000 }).then(() => true, () => false))) {
+      problems.push(`[${label}] the drawer stayed open after switching to "${title}"`)
+    }
+  }
+
+  console.log(`[${label}] thread list: switched Smoke alpha → Smoke beta → Smoke alpha, transcripts followed`)
+}
+
+await switchSessions(page, 'tablet', false)
 await assertWorkspaceAlive(page, 'tablet')
 
 // Production build ships the wordmark face (resolved from app/node_modules).
@@ -215,29 +253,32 @@ async function phoneOverflow(surface) {
   }
 }
 
-// Chat input usable at phone width: on screen, editable, and a tap focuses
-// it. The smoke deliberately does NOT type: typing intermittently crashes the
-// workspace pane through the upstream render loop — reproduced 3/4 in the
-// unmodified upstream Electron app (README "Deviations") — so a typing step
-// would make this gate flaky on an upstream defect, and tolerating it would
-// hide a crashed main surface.
+// Chat input usable at phone width: on screen, and it takes typed text (not
+// sent). Typing used to trip the render loop and could crash the workspace;
+// with the patch it must stay error-free.
 const composer = phonePage.locator('[contenteditable="true"], textarea').first()
 await composer.tap()
+await phonePage.keyboard.type('phone smoke')
 const composerState = await composer.evaluate(element => {
   const box = element.getBoundingClientRect()
 
   return {
-    focused: element === document.activeElement || element.contains(document.activeElement),
-    editable: element.isContentEditable || (element.tagName === 'TEXTAREA' && !element.disabled && !element.readOnly),
+    text: (element.isContentEditable ? element.innerText : element.value).trim(),
     onScreen: box.left >= 0 && box.right <= window.innerWidth && box.top >= 0 && box.bottom <= window.innerHeight
   }
 })
-if (!composerState.focused || !composerState.editable || !composerState.onScreen) {
+if (composerState.text !== 'phone smoke' || !composerState.onScreen) {
   problems.push(`[phone] composer not usable: ${JSON.stringify(composerState)}`)
 }
-await phonePage.waitForTimeout(1_000)
+await phonePage.waitForTimeout(3_000)
 await assertWorkspaceAlive(phonePage, 'phone')
 await phoneOverflow('chat')
+await phonePage.keyboard.press('Control+A')
+await phonePage.keyboard.press('Backspace')
+
+await switchSessions(phonePage, 'phone', true)
+await assertWorkspaceAlive(phonePage, 'phone')
+await phoneOverflow('session transcript')
 
 const toggle = phonePage.getByRole('button', { name: /show sidebar|hide sidebar/i }).first()
 await toggle.tap({ timeout: 15_000 })
@@ -309,15 +350,8 @@ await shot(onboardingPage, '8-phone-onboarding')
 
 await browser.close()
 
-const verdict = classifyPageErrors(pageErrors, guardSite)
-problems.push(...verdict.problems)
-
-for (const [label, count] of Object.entries(verdict.tolerated)) {
-  console.log(
-    `[${label}] baseline-shaped render-loop pageerror ×${count} (tolerated, bound ${KNOWN_LOOP_LIMIT_PER_PHASE}): ` +
-      'guard message, top frame exactly at the guard site'
-  )
-}
+console.log(`page errors: ${pageErrors.length} (none tolerated)`)
+problems.push(...classifyPageErrors(pageErrors).problems)
 
 if (problems.length) {
   console.error(`SMOKE FAILED:\n${problems.join('\n')}`)
@@ -325,6 +359,6 @@ if (problems.length) {
 }
 
 console.log(
-  'SMOKE OK: onboarding → connected chat surface (tablet + phone), page errors limited to the bounded ' +
-    'baseline render-loop shape, zero bridge errors'
+  'SMOKE OK: onboarding → connected chat surface (tablet + phone), thread-list switching works, ' +
+    'zero page errors, zero bridge errors'
 )
