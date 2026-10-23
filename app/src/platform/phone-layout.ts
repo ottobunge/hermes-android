@@ -11,12 +11,13 @@
 //      than clip;
 //   3. the statusbar scrolls sideways instead of clipping;
 //   4. the drawer closes on a tap outside it, or when a tap inside SELECTS:
-//      it navigates, it is a nav item, or the tapped session row ends up the
-//      selected row — which also covers re-selecting the current session and
-//      switching focus to another already-open session, neither of which
-//      changes the URL. Browsing controls inside the drawer (paging, project
-//      drill-in/Back, group expansion) keep it open. The hover-out dismissal
-//      never fires on touch;
+//      a session (or cron job) row's main target, a nav item, or anything that
+//      navigates. Which kind of tap it is gets decided at pointerdown, from
+//      the row's structure — selecting can re-select the current session,
+//      only switch focus (no URL change), or even unmount the row (an Unread
+//      filter drops it once it is read). Browsing controls inside the drawer
+//      (paging, project drill-in/Back, group expansion) keep it open. The
+//      hover-out dismissal never fires on touch;
 //   5. overlay views (Settings, Scheduled jobs, …) keep their titlebar-height
 //      top inset but drop the ~44px side/bottom gutters, which left a 300px
 //      card on a 390px screen;
@@ -57,29 +58,35 @@ function closeDrawer(overlay: Element) {
   }
 }
 
-// Taps that SELECT even when the URL doesn't change:
+// Taps that SELECT even when the URL doesn't change, decided at pointerdown
+// from structure (the pressed row may not survive the selection):
 //   - a nav item: every sidebar menu-button calls onNavigate;
-//   - a session row that is the selected row once the click has settled.
-//     session-row.tsx paints its SidebarRowShell — the RowButton's direct
-//     parent — with the row-active background while that session is the
-//     focused one (sidebar/index.tsx selection). A plain row click resumes the
-//     session via openSession, which may only FOCUS an already-open tile or
-//     tab (open-session.ts) — no route change, and the row was merely
-//     "open" (row-open background) at press time — so the check must run
-//     after the click, not at pointerdown.
-// Every other RowButton (chrome.tsx), e.g. "Show more" (workspace-header.tsx),
-// project drill-in/Back (overview-row.tsx) or group expansion
-// (gateway-groups.tsx), never gets a selected shell: it is browsing, and only
-// closes the drawer if it actually navigates.
+//   - the main tap target of an entity row: a RowButton (chrome.tsx
+//     SidebarRowBody) whose DIRECT parent is a row shell wrapped in that row's
+//     context menu. session-row.tsx renders SessionContextMenu →
+//     ActionsContextMenu → ContextMenuTrigger asChild → SidebarRowShell →
+//     SidebarRowBody, so the shell carries data-slot="context-menu-trigger";
+//     cron rows (cron-jobs-section.tsx) are built the same way. A plain click
+//     on it resumes the session (openSession), whatever that does to the DOM:
+//     route, focus an open tile/tab without routing, or — with the Unread
+//     filter — mark it read and so unmount the row.
+// Browsing RowButtons never have that shape: "Show more" (workspace-header.tsx)
+// and Back (overview-row.tsx) sit in bare shells with no context menu; project
+// drill-in (overview-row.tsx), lane headers (workspace-group.tsx) and gateway
+// group labels (gateway-groups.tsx) are SidebarRowLinks inside a
+// SidebarRowCluster, not direct children of the (context-menu) shell.
+// ⇧-clicks on a session row (pin, archive, new window — session-row-gesture.ts)
+// are not selections and keep the drawer.
 const NAV_ITEM = '[data-sidebar="menu-button"]'
+const ENTITY_ROW_SHELL = '[data-slot="context-menu-trigger"]'
 const SELECTED_ROW = '.bg-\\(--ui-row-active-background\\)'
-// Focus changes commit through the session stores a few frames after the
-// click; give the selection that long to land.
+// Other rows: a selection may still show up as the row turning selected a
+// few frames after the click (focus commits through the session stores).
 const SELECTION_SETTLE_MS = 300
 
 // What a press inside the drawer began on; one delegated click handler acts
 // after the click, so nothing is attached per gesture.
-let press: null | { href: string; navItem: boolean; rowButton: Element | null } = null
+let press: null | { href: string; selects: boolean; rowButton: Element | null } = null
 
 function isSelectedRow(rowButton: Element | null): boolean {
   return Boolean(rowButton?.isConnected && rowButton.parentElement?.matches(SELECTED_ROW))
@@ -96,10 +103,12 @@ function onPointerDown(event: PointerEvent) {
 
   if (overlay.contains(target)) {
     // A tap that selects hands the screen back (decided after the click).
+    const rowButton = target.closest('[data-slot="row-button"]')
+
     press = {
       href: location.href,
-      navItem: Boolean(target.closest(NAV_ITEM)),
-      rowButton: target.closest('[data-slot="row-button"]')
+      selects: Boolean(target.closest(NAV_ITEM) || rowButton?.parentElement?.matches(ENTITY_ROW_SHELL)),
+      rowButton
     }
 
     return
@@ -114,13 +123,16 @@ function onPointerDown(event: PointerEvent) {
   closeDrawer(overlay)
 }
 
-function onClick() {
+function onClick(event: MouseEvent) {
   const pressed = press
   press = null
 
   if (!pressed) {
     return
   }
+
+  // ⇧ (alone or combined) turns a row click into pin/archive/new-window.
+  const selects = pressed.selects && !event.shiftKey
 
   const started = performance.now()
 
@@ -131,7 +143,7 @@ function onClick() {
       return
     }
 
-    if (pressed.navItem || location.href !== pressed.href || isSelectedRow(pressed.rowButton)) {
+    if (selects || location.href !== pressed.href || isSelectedRow(pressed.rowButton)) {
       closeDrawer(overlay)
 
       return

@@ -258,6 +258,144 @@ Run `npm run build` before every smoke: a stale `dist/` serves a blank page
 
 ## Verification
 
+### Round 13 (2026-10-23): drawer dismissal survives a filtered-row unmount
+
+**What was still wrong (round 12, 349ff6f).** Round 12 decided "was that a
+selection?" by watching the **pressed DOM node** after the click: did it
+end up as the selected row? Selecting a session can destroy that node.
+- With the Unread status filter on, tapping an already-open, unfocused,
+  unread session A works like this:
+  - `openSession` calls `markSessionRead` **before** focusing
+    (`open-session.ts:110-114`);
+  - the marker clears, so A no longer matches the filter
+    (`sidebar/index.tsx:612-656`), and React unmounts the pressed row;
+  - focus moves to A's tab without routing.
+- Round 12 then saw no URL change and no connected selected row, so the
+  drawer stayed open.
+- Sibling case: any filter that can drop the pressed row on activation, e.g.
+  search narrowing, fails the same way.
+
+**Discriminator: decided at pointerdown, from the row's structure**
+(`src/platform/phone-layout.ts:80-146`).
+- A tap selects if it hits a nav item (`[data-sidebar="menu-button"]`), or
+  an **entity row's main target**: a `RowButton` whose **direct parent** is
+  a row shell wrapped in that row's context menu
+  (`[data-slot="context-menu-trigger"]`, `:81`, `:110`).
+- Verified against the components: `session-row.tsx` renders
+  `SessionContextMenu` → `ActionsContextMenu` → `ContextMenuTrigger asChild`
+  → `SidebarRowShell` → `SidebarRowBody` (the RowButton). Cron rows
+  (`cron-jobs-section.tsx:316-385`) have the same shape.
+- **Browsing controls never have that shape:**
+  - "Show more" (`projects/workspace-header.tsx:85`) and Back / "All
+    projects" (`projects/overview-row.tsx:66`) are RowButtons in **bare**
+    shells with no context menu;
+  - project drill-in (`overview-row.tsx:180`), lane headers
+    (`projects/workspace-group.tsx:185`) and gateway group labels
+    (`gateway-groups.tsx:272`) are `SidebarRowLink`s inside a
+    `SidebarRowCluster`, not direct children of the shell, even where the
+    shell has a context menu (`WorkspaceContextMenu`, `ProjectContextMenu`).
+- **Audited in the real production DOM** at 390px (flat list, grouped
+  overview, entered project):
+  - Smoke alpha / Smoke beta → parent `context-menu-trigger` → selects;
+  - "Open Smoke project" and "All projects" → parent `div` → browse.
+  - "Show more" and gateway group labels don't render with this fixture (a
+    long lane and several gateways/profiles would be needed); they are
+    covered by the source analysis above and the unit test.
+- ⇧-clicks on a session row (pin, archive, new window,
+  `session-row-gesture.ts`) are not selections and keep the drawer (`:135`).
+  ⌃-click (open in new tab, which focuses it) is a selection.
+- Because the decision is made before the click, unmounting, focus-only and
+  routed selections all dismiss. URL change and the round-12 "row became
+  selected" check stay as fallbacks for any other row type (`:146`).
+
+**Why the Unread-filter case is a unit test, not a smoke scenario.**
+- Live on the scratch gateway, a session that is already **open** can't be
+  unread. "Mark as unread" from its row menu didn't stick: the backend still
+  reported `unread=False`, because opening clears the persisted flag
+  (`clearUnreadOnOpen`). So the Unread filter showed no rows.
+- The reviewer's case uses the **runtime** marker, which is set only when a
+  background turn finishes. That needs a model provider, which the scratch
+  gateway deliberately doesn't have.
+- The Filters → Status → Unread path itself works headlessly via Radix
+  keyboard navigation (pointer clicks on the submenu fail at 390px).
+- So the case is covered by **`src/platform/phone-layout.test.ts`** (jsdom,
+  the real `installPhoneLayout()` handlers, fixture rows mirroring the
+  audited DOM). Its cases:
+  - a tap whose click handler **removes the session row** (no URL change)
+    must dismiss (`:64`);
+  - a focus-only switch (row turns selected 50 ms later) dismisses (`:77`);
+  - reselect and nav items dismiss (`:90`);
+  - Show more / All projects / drill-in keep the drawer, **even when they
+    remove themselves** (`:103`);
+  - ⇧-click and the row kebab keep it (`:122`);
+  - an outside tap closes it, and at tablet width nothing fires (`:131`).
+
+**Negative control:** `phone-layout.ts` restored to round 12 (`git show
+349ff6f:…`). Exactly the unmount case fails:
+
+```
+     × dismisses when selecting a session UNMOUNTS its row (Unread filter), focus-only, no URL change 438ms
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+      Tests  1 failed | 5 passed (6)
+```
+
+**Smoke P3: the focus-switch scenario now asserts its defining property.**
+If the URL changed while focusing Smoke alpha, it fails with
+`focus-switch scenario changed the URL … it must exercise a focus-only
+selection` (`scripts/smoke.mjs:513-519`), instead of only logging "no route
+change". A future routing change can no longer silently turn it into a
+routed-switch test.
+
+**Tooling note.** The Chromium 155.0.8059.79 store path used in earlier
+rounds had been garbage-collected from the Nix store. `nix build
+nixpkgs#chromium` fetched 155.0.8059.84 from cache.nixos.org (Nix store
+only, nothing installed globally), and all round-13 runs use it.
+
+**Gates** (final code, in order, all exit 0):
+
+```
+npm run typecheck                                        → exit 0
+npm run build                                            → exit 0
+npx vitest run src/platform src/app/open-session.test.ts → exit 0
+  Test Files  4 passed (4)
+  Tests  50 passed (50)
+node --test scripts/smoke-classifier.test.mjs            → exit 0
+  # tests 8
+  # pass 8
+  # fail 0
+node scripts/smoke.mjs …                                 → exit 0, 3 consecutive runs
+```
+
+Final smoke run, verbatim (token redacted):
+
+```
+screenshot: /tmp/smoke-out/1-onboarding.png
+[tablet] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+[tablet] first-run overlay: provider picker after 1.7s (gateway has no model provider) → skipped
+[tablet] thread list: switched Smoke alpha → Smoke beta → Smoke alpha, transcripts followed
+screenshot: /tmp/smoke-out/2-connected-1280.png
+screenshot: /tmp/smoke-out/3-connected-tablet-820.png
+[phone] first-run overlay: none (provider configured or previously skipped)
+screenshot: /tmp/smoke-out/4-connected-phone-390.png
+[phone] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+[phone] thread list: switched Smoke alpha → Smoke beta → Smoke alpha, transcripts followed
+screenshot: /tmp/smoke-out/5-phone-drawer-open.png
+screenshot: /tmp/smoke-out/6-phone-settings.png
+screenshot: /tmp/smoke-out/7-phone-capabilities.png
+screenshot: /tmp/smoke-out/8-phone-onboarding.png
+[phone] first-run overlay: none (provider configured or previously skipped)
+[phone] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+screenshot: /tmp/smoke-out/9-phone-drawer-project.png
+[phone] drawer browsing: project drill-in and "All projects" kept the drawer open
+[phone] first-run overlay: none (provider configured or previously skipped)
+[phone] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+screenshot: /tmp/smoke-out/10-phone-drawer-two-open-sessions.png
+[phone] focus switch: Smoke beta → already-open Smoke alpha (no route change) dismissed the drawer
+page errors: 0 (none tolerated)
+SMOKE OK: onboarding → connected chat surface (tablet + phone), thread-list switching works, zero page errors, zero bridge errors
+exit=0
+```
+
 ### Round 12 (2026-10-23): drawer dismisses on a session focus switch
 
 **What regressed (round 11, 3af0bf9).**

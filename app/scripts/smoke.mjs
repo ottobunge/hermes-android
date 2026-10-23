@@ -510,9 +510,17 @@ async function run() {
       problems.push(`[phone] tapping "Smoke alpha" did not focus it (row is ${after})`)
     }
 
+    // The defining property of this scenario: selection WITHOUT routing. If a
+    // future change routes here, this would silently become a routed-switch
+    // test (already covered above), so it fails instead.
+    if (focusPage.url() !== before.url) {
+      problems.push(
+        `[phone] focus-switch scenario changed the URL (${before.url} → ${focusPage.url()}) — it must exercise a focus-only selection`
+      )
+    }
+
     if (problems.length === focusProblems) {
-      const routed = focusPage.url() !== before.url ? 'route changed' : 'no route change'
-      console.log(`[phone] focus switch: Smoke beta → already-open Smoke alpha (${routed}) dismissed the drawer`)
+      console.log('[phone] focus switch: Smoke beta → already-open Smoke alpha (no route change) dismissed the drawer')
     }
   }
 
