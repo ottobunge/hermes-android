@@ -255,9 +255,12 @@ async function testAndReload(gateway: SavedGateway) {
   applyAndReload(gateway)
 }
 
+/** Page lifecycle seam (jsdom's location.reload can't be spied on). */
+export const pageLifecycle = { reload: () => window.location.reload() }
+
 function applyAndReload(gateway: SavedGateway) {
   saveGateway(gateway)
-  setTimeout(() => window.location.reload(), 400)
+  setTimeout(() => pageLifecycle.reload(), 400)
 }
 
 function readJson<T>(key: string, fallback: T): T {
@@ -430,7 +433,15 @@ export const bridge: Bridge = {
     },
     remove: () => unsupported(),
     setPrimary: async () => ({ ok: true, registry: registry() }),
-    test: async () => testGateway(requireGateway())
+    // Diagnoses the SAVED row the registry lists — which may differ from the
+    // gateway this page booted with (Settings → "Save for next restart").
+    test: async () => {
+      const saved = loadGateway()
+
+      return saved
+        ? testGateway(saved)
+        : { ok: false, reachable: false, baseUrl: '', error: 'No Hermes gateway is configured.' }
+    }
   },
   cloud: {
     status: async () => ({ portalBaseUrl: 'https://portal.nousresearch.com', signedIn: false }),

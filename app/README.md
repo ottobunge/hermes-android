@@ -45,10 +45,18 @@ The renderer's entire native surface is one object, `window.hermesDesktop`
   keeps the saved token **only for the same normalized endpoint**. A new
   endpoint needs its own token, and an edit that ends without a token is
   refused.
-- **Changing the endpoint or token** through either UI goes through the same
-  lifecycle: test (`/api/status` → authed `/api/sessions` → `/api/ws` open),
-  then save, then reload. Reachability alone never counts as success. A
-  label-only registry edit is saved in place.
+- **There are two ways a change takes effect.**
+  - Applying a new endpoint or token tests it first (`/api/status` → authed
+    `/api/sessions` → `/api/ws` open), then saves, then reloads.
+    Reachability alone never counts as success. Both Settings → Gateway "Save
+    and reconnect" and a registry edit that changes the endpoint or token
+    take this path.
+  - Settings → Gateway "Save for next restart" only persists. It does no
+    test, and the running page stays on its booted gateway until the next
+    launch.
+  - A label-only registry edit is saved in place.
+  - A registry row's **Test** checks the **saved** gateway the row shows,
+    which may differ from the booted one.
 - No saved gateway → onboarding (`src/platform/onboarding.tsx`), which mounts
   the desktop's own **Settings → Gateway** panel.
 - `api(request)` (`src/platform/api-transport.ts`) mirrors Electron's REST
@@ -169,8 +177,8 @@ state.
   stay docked (upstream's collapse breakpoint is 640px, not 768px). Below
   640px the drawer has no swipe gesture: open and close it with the titlebar
   toggle or a tap outside. No bottom nav.
-- **Render-loop errors on every page: confirmed upstream behavior, not a
-  port defect.** Each boot throws several (4–9 observed) uncaught `Maximum update depth exceeded.
+- **Render-loop errors on every page: the original loop is confirmed
+  upstream behavior, not a port defect.** Each boot throws several (4–9 observed) uncaught `Maximum update depth exceeded.
   The result of getSnapshot should be cached…` errors at every width. Traced
   in a dev build: the loop is assistant-ui's thread-list store
   (`@assistant-ui/core` `ThreadListRuntimeImpl` state via `@assistant-ui/tap`'s
@@ -178,8 +186,9 @@ state.
   fresh object whose fields are all `===` the previous ones, so tap's
   50-commit guard throws. The app still renders and works afterwards. See
   "Upstream comparison" below for the Electron reproduction. The smoke
-  tolerates exactly this message, counts it and prints it, and fails on any
-  other page error.
+  tolerates only errors with this loop's shape (message, top frame,
+  connected phase, bounded count), and fails on anything else. See "Smoke"
+  for what that does and doesn't establish.
 - **`app/android/` does not exist.** `npx cap add android` / `npx cap sync
   android` were not run, so the native project is not committed yet.
 - **No Android SDK/JDK on this machine** (`java`, `sdkmanager`, `adb` absent,
@@ -198,6 +207,7 @@ npm install
 npm run typecheck          # tsc -p . --noEmit
 npm test                   # vitest run (full suite is slow: ~1000 files)
 npx vitest run src/platform  # bridge checks only
+node --test scripts/smoke-classifier.test.mjs  # smoke page-error classifier
 npm run build              # vite build → dist/
 npm run dev                # http://127.0.0.1:5174 (browser dev against a gateway)
 npm run preview            # serves dist/ on http://127.0.0.1:4174
@@ -231,43 +241,96 @@ hermes gateway run &                       # initializes state.db (else /api/ses
 
 ## Verification
 
-Round 5 (2026-10-23, review-panel fixes):
+Round 6 (2026-10-23, review-panel R2 fixes). Gates run in this order, all exit 0:
 
-- `npm run typecheck` — **pass** (exit 0).
-- `npm run build` — **pass** (exit 0). The `Collapse-Bold` font is now emitted
-  (`dist/assets/Collapse-Bold-*.woff2`, referenced from `styles-*.css`).
-  `vite preview` serves it as `200 font/woff2`, and in the smoke
-  `document.fonts.load('700 32px Collapse')` resolves a face.
-- `npx vitest run src/platform` — **pass**, 16/16 (`bridge.test.ts`). New
-  regression checks:
-  - a cross-host edit with the token left blank is refused on **both** save
-    paths, and the stored gateway is untouched;
-  - a same-endpoint edit keeps the saved token, and a label-only edit saves
-    in place with no request;
-  - a material registry edit runs test → save (reload scheduled);
-  - apply without a token is refused before any request;
-  - after a save, REST stays on the booted gateway;
-  - headers arrived but body stalled → `Timed out reading…`.
-- `npx vitest run` (full suite) — not rerun this round. Round 2 result:
+```
+npm run typecheck                               → exit 0
+npm run build                                   → exit 0
+npx vitest run src/platform                     → exit 0
+  Test Files  1 passed (1)
+  Tests  18 passed (18)
+node --test scripts/smoke-classifier.test.mjs   → exit 0
+  # Subtest: baseline-shaped errors within the bound are tolerated
+  ok 1 - baseline-shaped errors within the bound are tolerated
+  # Subtest: the same message from an unrelated stack fails
+  ok 2 - the same message from an unrelated stack fails
+  # Subtest: a capabilities frame below an unrelated top frame still fails
+  ok 3 - a capabilities frame below an unrelated top frame still fails
+  # Subtest: more than the bound fails
+  ok 4 - more than the bound fails
+  # Subtest: onboarding gets no allowance
+  ok 5 - onboarding gets no allowance
+  # Subtest: any other message fails
+  ok 6 - any other message fails
+  # tests 6
+  # suites 0
+  # pass 6
+  # fail 0
+  # cancelled 0
+  # skipped 0
+  # todo 0
+  # duration_ms 125.435825
+```
+
+- **`bridge.test.ts` (18 tests).** Beyond URL/transport mapping it covers:
+  - cross-host blank-token refusal on both save paths;
+  - the same-endpoint token kept, and a label-only edit saved in place;
+  - test → save → reload for a material registry edit. It asserts the
+    `/api/ws` probe URL and token **of the new gateway** and that a reload is
+    scheduled only after 400 ms, using fake timers and a `pageLifecycle.reload`
+    spy;
+  - a failed WebSocket probe (registry save **and** apply) persists nothing
+    and schedules no reload;
+  - a registry row's **Test** contacting the **saved** gateway (B: REST,
+    token, WS) while `api()` stays on the booted gateway (A);
+  - apply without a token refused;
+  - a body stall after headers.
+
+  **Mutation check:** removing the WS probe fails 3 tests, removing the
+  reload fails 1, and pointing Test back at the booted gateway fails 1.
+- `npm run build` still emits `Collapse-Bold-*.woff2`; the smoke checks that
+  it loads.
+- `npx vitest run` (full suite) — not rerun since round 2. Round 2 result:
   **FAILING**, 27 of 1012 files and 64 of 8403 tests (8332 passed), mostly
   12–15s timeouts under heavy host load. Not triaged. No tests are excluded.
 - `cap sync` / gradle — **not run** (no `android/`, no SDK).
 
-### Smoke: executed, PASSED (with the known upstream page error tolerated)
+### Smoke: executed, PASSED (bounded baseline render-loop errors tolerated)
 
 Scratch gateway (`hermes serve --port 19719` + `hermes gateway run`,
 throwaway `HERMES_HOME`, no model provider), production build on `vite
-preview`, headless Chromium 155. The smoke now:
-- attaches one listener per page, so errors aren't double-counted;
+preview`, headless Chromium 155. The smoke:
+- attaches one listener per page;
 - asserts the connected surface at 1280 **and** 820px;
 - checks that the Collapse font loads and that a `<webview>` reports
   "unavailable";
 - runs the phone drawer open/close and overflow check.
 
-Page errors whose message is **exactly** the known upstream `getSnapshot`
-render-loop message are counted and printed as tolerated. Any other page
-error, or any `hermesDesktop.* is not a function`, fails the run. Output,
-verbatim (token redacted):
+Page errors are judged by `scripts/smoke-classifier.mjs`. An error is
+tolerated only if **all** of these hold, and anything else fails the run:
+- the message is exactly the `@assistant-ui/tap` `useSyncExternalStore`
+  guard message;
+- the **top stack frame** is in the built `capabilities-*.js` chunk, where
+  every observed baseline occurrence originates;
+- it happens in a connected phase (`tablet`/`phone`). **Onboarding gets no
+  allowance.** The phase switches to `tablet` on the main-frame navigation
+  that "Save and reconnect" triggers;
+- the phase's count is at most **21**, which is 3x the typical baseline of 7
+  per phase. Observed counts: 6–7 here, 8–9 in a reviewer's run, 5 in
+  upstream Electron.
+
+**What this establishes, and what it doesn't.** The upstream Electron
+comparison shows the original loop is upstream behavior. The classifier
+establishes only that each tolerated error has that loop's **shape**: same
+generic message, same top frame inside tap's hook, connected surface, within
+the bound. Because the message and frame belong to tap's generic hook, a
+*new* loop through the same hook that stays within the bound would also pass.
+Errors from any other origin, during onboarding, or above the bound fail.
+Unit tests in `scripts/smoke-classifier.test.mjs` cover each of those cases,
+including an injected same-message error from an unrelated function. If the
+build renames the chunk, the smoke goes red rather than silently green.
+
+Output, verbatim (token redacted):
 
 ```
 screenshot: /tmp/smoke-out/1-onboarding.png
@@ -277,13 +340,16 @@ screenshot: /tmp/smoke-out/3-connected-tablet-820.png
 [phone] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
 screenshot: /tmp/smoke-out/4-connected-phone-390.png
 screenshot: /tmp/smoke-out/5-phone-drawer-open.png
-[tablet] known upstream pageerror ×7 (tolerated): Maximum update depth exceeded. The result of getSnapshot should be cached to avoid an infinite loop.
-[phone] known upstream pageerror ×6 (tolerated): Maximum update depth exceeded. The result of getSnapshot should be cached to avoid an infinite loop.
-SMOKE OK: onboarding → connected chat surface (tablet + phone), no pageerrors beyond the known upstream one, zero bridge errors
+[tablet] baseline-shaped render-loop pageerror ×6 (tolerated, bound 21): tap getSnapshot guard message, top frame in the capabilities-* chunk
+[phone] baseline-shaped render-loop pageerror ×6 (tolerated, bound 21): tap getSnapshot guard message, top frame in the capabilities-* chunk
+SMOKE OK: onboarding → connected chat surface (tablet + phone), page errors limited to the bounded baseline render-loop shape, zero bridge errors
 exit=0
 ```
 
 Earlier rounds (kept for history):
+- Round 5's smoke tolerated every page error with the exact message,
+  unbounded. Reviewers showed that this passed injected unrelated errors;
+  round 6 replaced it with the classifier above.
 - Round 3 failed on these same render-loop page errors; the phone step
   passed.
 - Round 2's "no uncaught page errors" note was wrong: that run aborted before

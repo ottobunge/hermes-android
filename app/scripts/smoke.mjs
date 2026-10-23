@@ -13,6 +13,8 @@ import { parseArgs } from 'node:util'
 
 import { chromium } from 'playwright-core'
 
+import { classifyPageErrors, KNOWN_LOOP_LIMIT_PER_PHASE } from './smoke-classifier.mjs'
+
 const { values: args } = parseArgs({
   options: {
     app: { type: 'string', default: 'http://127.0.0.1:4174' },
@@ -30,25 +32,14 @@ if (!args.gateway || !args.token) {
 fs.mkdirSync(args.out, { recursive: true })
 
 const problems = []
-const known = new Map()
+const pageErrors = []
 const browser = await chromium.launch({ executablePath: args.chromium, headless: true })
 
-// The one tolerated pageerror: upstream's assistant-ui thread-list render loop,
-// reproduced in the unmodified upstream Electron app (README "Upstream
-// comparison"). Exact-message match only — anything else still fails.
-const KNOWN_UPSTREAM_PAGEERROR =
-  'Maximum update depth exceeded. The result of getSnapshot should be cached to avoid an infinite loop.'
-
 // One listener set per page; `phase.label` moves with the run so a page's
-// errors are attributed (and counted) once.
+// errors are attributed (and counted) once. Page errors are judged at the end
+// by smoke-classifier.mjs.
 function watch(page, phase) {
-  page.on('pageerror', error => {
-    if (error.message === KNOWN_UPSTREAM_PAGEERROR) {
-      known.set(phase.label, (known.get(phase.label) ?? 0) + 1)
-    } else {
-      problems.push(`[${phase.label}] pageerror: ${error.message}`)
-    }
-  })
+  page.on('pageerror', error => pageErrors.push({ phase: phase.label, message: error.message, stack: error.stack }))
   page.on('console', msg => {
     const label = phase.label
     const text = msg.text()
@@ -81,6 +72,14 @@ const token = page.locator('input[type=password]')
 await token.waitFor({ timeout: 15_000 }) // appears once the URL probe resolves token auth
 await token.fill(args.token)
 await shot(page, '1-onboarding')
+// "Save and reconnect" reloads into the app: from that navigation on, the page
+// is the connected surface, not onboarding.
+page.on('framenavigated', frame => {
+  if (frame === page.mainFrame() && desktop.saved) {
+    desktop.label = 'tablet'
+  }
+})
+desktop.saved = true
 await Promise.all([
   page.waitForEvent('load', { timeout: 30_000 }),
   page.getByRole('button', { name: /save (and|&) reconnect/i }).click()
@@ -97,7 +96,6 @@ async function assertConnected(p, label) {
   }
 }
 
-desktop.label = 'tablet'
 await assertConnected(page, 'tablet')
 
 // Production build ships the wordmark face (resolved from app/node_modules).
@@ -162,8 +160,14 @@ if (overflow > 0) {
 
 await browser.close()
 
-for (const [label, count] of known) {
-  console.log(`[${label}] known upstream pageerror ×${count} (tolerated): ${KNOWN_UPSTREAM_PAGEERROR}`)
+const verdict = classifyPageErrors(pageErrors)
+problems.push(...verdict.problems)
+
+for (const [label, count] of Object.entries(verdict.tolerated)) {
+  console.log(
+    `[${label}] baseline-shaped render-loop pageerror ×${count} (tolerated, bound ${KNOWN_LOOP_LIMIT_PER_PHASE}): ` +
+      'tap getSnapshot guard message, top frame in the capabilities-* chunk'
+  )
 }
 
 if (problems.length) {
@@ -172,6 +176,6 @@ if (problems.length) {
 }
 
 console.log(
-  'SMOKE OK: onboarding → connected chat surface (tablet + phone), no pageerrors beyond the known upstream one, ' +
-    'zero bridge errors'
+  'SMOKE OK: onboarding → connected chat surface (tablet + phone), page errors limited to the bounded ' +
+    'baseline render-loop shape, zero bridge errors'
 )

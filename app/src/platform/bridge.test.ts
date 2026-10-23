@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { isMissingRestEndpoint } from '@/lib/gateway-rpc'
 
 import { gatewayApi } from './api-transport'
-import { bridge, resetActiveGatewayForTests } from './bridge'
+import { bridge, pageLifecycle, resetActiveGatewayForTests } from './bridge'
 import {
   buildGatewayWsUrl,
   loadGateway,
@@ -22,19 +22,30 @@ function respond(status: number, body: string, headers: Record<string, string> =
 
 afterEach(() => {
   vi.useRealTimers()
+  vi.restoreAllMocks()
   vi.unstubAllGlobals()
   localStorage.clear()
   resetActiveGatewayForTests()
 })
 
-/** A WebSocket that opens immediately (the /api/ws leg of a connection test). */
-class OpenSocket {
-  onopen: (() => void) | null = null
-  onerror: (() => void) | null = null
-  constructor() {
-    setTimeout(() => this.onopen?.())
+/** WebSocket double for the /api/ws leg of a connection test: records every
+ *  URL it is dialed with, then opens (or fails) on the next microtask. */
+function socketDouble(outcome: 'open' | 'error') {
+  const urls: string[] = []
+
+  class Socket {
+    onopen: (() => void) | null = null
+    onerror: (() => void) | null = null
+    constructor(url: string) {
+      urls.push(url)
+      queueMicrotask(() => (outcome === 'open' ? this.onopen?.() : this.onerror?.()))
+    }
+    close() {}
   }
-  close() {}
+
+  vi.stubGlobal('WebSocket', Socket)
+
+  return urls
 }
 
 describe('gateway config', () => {
@@ -142,9 +153,11 @@ describe('gateway edits (credential isolation + connection switch)', () => {
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
-  it('routes a material registry edit through test → save → reload', async () => {
+  it('routes a material registry edit through test → save → reload, probing the NEW gateway', async () => {
+    vi.useFakeTimers()
     saveGateway(a)
-    vi.stubGlobal('WebSocket', OpenSocket)
+    const reload = vi.spyOn(pageLifecycle, 'reload').mockImplementation(() => {})
+    const sockets = socketDouble('open')
     const fetchMock = vi.fn(async (_url: string, _init: RequestInit) => respond(200, '{}'))
     vi.stubGlobal('fetch', fetchMock)
 
@@ -154,7 +167,62 @@ describe('gateway edits (credential isolation + connection switch)', () => {
       'https://b.example/api/status',
       'https://b.example/api/sessions?limit=1'
     ])
+    expect(sockets).toEqual(['wss://b.example/api/ws?token=B'])
     expect(loadGateway()).toEqual({ name: 'B', httpUrl: 'https://b.example', token: 'B' })
+    expect(reload).not.toHaveBeenCalled()
+    vi.advanceTimersByTime(400)
+    expect(reload).toHaveBeenCalledTimes(1)
+  })
+
+  it('a failed WebSocket probe persists nothing and schedules no reload', async () => {
+    vi.useFakeTimers()
+    saveGateway(a)
+    const reload = vi.spyOn(pageLifecycle, 'reload').mockImplementation(() => {})
+    const sockets = socketDouble('error')
+    vi.stubGlobal('fetch', async () => respond(200, '{}'))
+
+    await expect(
+      bridge.connections.save({ id: 'gateway', kind: 'remote', label: 'B', url: 'https://b.example', token: 'B' })
+    ).rejects.toThrow(/WebSocket/)
+    await expect(
+      bridge.applyConnectionConfig({
+        mode: 'remote',
+        remoteAuthMode: 'token',
+        remoteUrl: 'https://b.example',
+        remoteToken: 'B'
+      })
+    ).rejects.toThrow(/WebSocket/)
+
+    expect(sockets).toEqual(['wss://b.example/api/ws?token=B', 'wss://b.example/api/ws?token=B'])
+    expect(loadGateway()).toEqual(a)
+    vi.advanceTimersByTime(5_000)
+    expect(reload).not.toHaveBeenCalled()
+  })
+
+  it('Test on the registry row checks the SAVED gateway while REST stays on the booted one', async () => {
+    saveGateway(a)
+    const sockets = socketDouble('open')
+    const fetchMock = vi.fn(async (_url: string, _init: RequestInit) => respond(200, '{}'))
+    vi.stubGlobal('fetch', fetchMock)
+    await bridge.getConnection()
+    await bridge.saveConnectionConfig({
+      mode: 'remote',
+      remoteAuthMode: 'token',
+      remoteUrl: 'https://b.example',
+      remoteToken: 'B'
+    })
+    fetchMock.mockClear()
+
+    await expect(bridge.connections.test('gateway')).resolves.toMatchObject({ ok: true, baseUrl: 'https://b.example' })
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      'https://b.example/api/status',
+      'https://b.example/api/sessions?limit=1'
+    ])
+    expect(fetchMock.mock.calls[1][1].headers).toMatchObject({ 'X-Hermes-Session-Token': 'B' })
+    expect(sockets).toEqual(['wss://b.example/api/ws?token=B'])
+
+    await bridge.api({ path: '/api/config' })
+    expect(fetchMock.mock.calls.at(-1)?.[0]).toBe('https://a.example/api/config')
   })
 
   it('refuses to apply a gateway without a token, before any request', async () => {
