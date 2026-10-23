@@ -27,8 +27,8 @@
           pkgs.jdk17
           pkgs.nodejs_22
         ];
-        ANDROID_HOME = "${androidComposition.androidsdk}/share/android-sdk";
-        ANDROID_SDK_ROOT = "${androidComposition.androidsdk}/share/android-sdk";
+        ANDROID_HOME = "${androidComposition.androidsdk}/libexec/android-sdk";
+        ANDROID_SDK_ROOT = "${androidComposition.androidsdk}/libexec/android-sdk";
         JAVA_HOME = "${pkgs.jdk17}/lib/openjdk";
         # Gradle's aapt2/AAPT2 daemon needs the Nix glibc loader path.
         LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath [ pkgs.zlib pkgs.ncurses5 ]}";
