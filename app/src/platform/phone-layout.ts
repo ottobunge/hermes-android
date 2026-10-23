@@ -11,8 +11,9 @@
 //      than clip;
 //   3. the statusbar scrolls sideways instead of clipping;
 //   4. the drawer closes on a tap outside it, or when a tap inside SELECTS:
-//      a session row's main target, a nav item, or anything that navigates. Which kind of tap it is gets decided at pointerdown, from
-//      the row's structure — selecting can re-select the current session,
+//      a session row's main target, a nav item, or anything that navigates.
+//      Which kind of tap it is gets decided at pointerdown, from the row's
+//      structure — selecting can re-select the current session,
 //      only switch focus (no URL change), or even unmount the row (an Unread
 //      filter drops it once it is read). Browsing controls inside the drawer
 //      (paging, project drill-in/Back, group expansion) keep it open. The
@@ -71,13 +72,17 @@ function closeDrawer(overlay: Element) {
 //     (Cron rows look similar in source, but their Tip overrides the body's
 //     data-slot to "tooltip-trigger", so they never match the RowButton test;
 //     their tap only expands the row.)
-//   - EXCEPT controls nested inside that RowButton that don't resume: the
-//     reorder grab handle (chrome.tsx SidebarRowGrab, data-reorder-handle,
-//     stops its click from reaching the row) and the row-actions slot
-//     (data-row-actions; inside the body in card mode). This is the same
-//     "not a press on the row itself" predicate session-row.tsx uses for its
-//     drag gesture. A press there dismisses only if it navigated (never via
-//     the selected-row check: the handle of the focused row is "selected").
+//   - EXCEPT the controls nested inside that RowButton that stop their click
+//     from reaching it, so they never resume: the reorder grab handle
+//     (chrome.tsx SidebarRowGrab, data-reorder-handle) and the PR chip
+//     (pr-tag.tsx PrTag, data-pr-link; in the row's trailing slot, so inside
+//     the body in card mode). A `grep stopPropagation` over the sidebar row
+//     chrome finds no other such control inside a session RowButton. Other
+//     nested controls DO resume and stay selections: in card mode the row
+//     actions (data-row-actions) — the ⋯ kebab and the <time> stamp — sit
+//     inside the body and their clicks bubble to onResume. A press on an
+//     excluded control dismisses only if it navigated (never via the
+//     selected-row check: the handle of the focused row is "selected").
 // Browsing RowButtons never have that shape: "Show more" (workspace-header.tsx)
 // and Back (overview-row.tsx) sit in bare shells with no context menu; project
 // drill-in (overview-row.tsx), lane headers (workspace-group.tsx) and gateway
@@ -87,7 +92,7 @@ function closeDrawer(overlay: Element) {
 // are not selections and keep the drawer.
 const NAV_ITEM = '[data-sidebar="menu-button"]'
 const ENTITY_ROW_SHELL = '[data-slot="context-menu-trigger"]'
-const ROW_NESTED_CONTROL = '[data-reorder-handle], [data-row-actions]'
+const ROW_NESTED_CONTROL = '[data-reorder-handle], [data-pr-link]'
 const SELECTED_ROW = '.bg-\\(--ui-row-active-background\\)'
 // Other rows: a selection may still show up as the row turning selected a
 // few frames after the click (focus commits through the session stores).

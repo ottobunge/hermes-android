@@ -274,6 +274,37 @@ async function run() {
   // Chat input usable at phone width: on screen, and it takes typed text (not
   // sent). Typing used to trip the render loop and could crash the workspace;
   // with the patch it must stay error-free.
+  // The composer's editor element is replaced once while the restored session
+  // boots (measured 0.6–0.9 s after it first appears, README round 15); text
+  // typed into the first one is discarded with it. Type only once the same
+  // editor element has stayed mounted for 1.5 s.
+  const stableComposer = await phonePage
+    .waitForFunction(
+      () => {
+        const editor = document.querySelector('[contenteditable="true"], textarea')
+        const w = window
+        const now = performance.now()
+
+        if (!editor) {
+          return false
+        }
+
+        if (w.__smokeEditor !== editor) {
+          w.__smokeEditor = editor
+          w.__smokeEditorSince = now
+        }
+
+        return now - w.__smokeEditorSince >= 1_500
+      },
+      undefined,
+      { polling: 100, timeout: 15_000 }
+    )
+    .then(() => true, () => false)
+
+  if (!stableComposer) {
+    problems.push('[phone] the composer editor kept remounting for 15s')
+  }
+
   const composer = phonePage.locator('[contenteditable="true"], textarea').first()
   await composer.tap()
   // The tap's focus lands asynchronously (the editor mounts its selection

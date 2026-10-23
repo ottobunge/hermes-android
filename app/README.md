@@ -258,6 +258,139 @@ Run `npm run build` before every smoke: a stale `dist/` serves a blank page
 
 ## Verification
 
+### Round 15 (2026-10-23): card kebab/timestamp taps dismiss the drawer again
+
+**What regressed (round 14, 87f702d).**
+- Round 14 excluded every press inside `[data-reorder-handle],
+  [data-row-actions]`. But `[data-row-actions]` only marks a region excluded
+  from **drag**.
+- In **card** mode the actions cluster sits **inside** the main RowButton
+  (`session-row.tsx:302-340`, `:553-566`). Its ⋯ kebab (no propagation
+  guard) and its focusable `<time>` stamp (`:233-241`) bubble to the row's
+  click handler and call `onResume()` (`:438-454`).
+- So a card kebab or timestamp tap selected the session (often focus-only,
+  no URL change) and the drawer stayed open. The reviewer's
+  actual-component probe: 1 resume, 0 close events (round 13: 2).
+- Compact rows were unaffected: their actions cluster is a **sibling** of
+  the RowButton.
+
+**Fix** (`src/platform/phone-layout.ts:95`, `:120`). Exclude only the
+nested controls that **stop their click before it reaches the row**, so they
+never resume: `[data-reorder-handle], [data-pr-link]`.
+- **Audit.** `grep stopPropagation` over `src/app/chat/sidebar/**` and
+  `src/app/chat/pr-tag.tsx` turned up only two such controls **inside a
+  session RowButton**:
+  - the reorder handle (`chrome.tsx:348-349`);
+  - the **PR chip** (`pr-tag.tsx:54-61`: `data-pr-link`, stops click and
+    pointerdown, opens the PR externally). It is in the row's trailing slot
+    (`session-row.tsx:212`), so it sits inside the body in card mode. The
+    brief named only the handle; this is the one other control, excluded
+    exactly as the brief instructs for that case.
+- Every other hit is outside session rows:
+  - the header "+" buttons (`chrome.tsx:81`);
+  - lane and project menus (`projects/workspace-header.tsx:182`,
+    `project-menu.tsx:214,266`);
+  - the connection switcher (`connection-switcher.tsx:79,135,164`);
+  - sidebar header nav (`sidebar/index.tsx:1857,1888`);
+  - the row's own modifier-click branch (`session-row.tsx:458`).
+- Plugin contributions in the row's `SessionRowSlot` areas are unknown code;
+  a plugin control that stops its click inside a card row would need adding
+  here.
+- `[data-row-actions]` is no longer excluded. Compact actions have no
+  RowButton ancestor (so they're never selections), and card actions resume
+  (so they're selections and dismiss).
+
+**Coverage** (`src/platform/phone-layout.test.ts`, 16 tests). The card
+fixture now carries the real card cluster inside the body: the `<time>`
+stamp, a PR chip with its real `stopPropagation`, and the ⋯ kebab. New cases:
+- card **kebab** tap on an unfocused row → 1 resume, dismisses (`:235`);
+- card **timestamp** tap on an unfocused row → 1 resume, dismisses (`:235`);
+- **compact kebab** (outside the RowButton) → 0 resumes, stays (`:247`);
+- card **PR chip** → 0 resumes, stays (`:257`).
+
+The existing handle (compact and card, focused and unfocused), body,
+Unread-unmount, focus-switch, browsing, ⇧-click and outside/tablet cases are
+kept and pass.
+
+**Negative controls:**
+1. `[data-row-actions]` re-added to the exclusion. Exactly the card kebab and
+   timestamp tests fail:
+
+```
+ × dismisses when a card row's kebab tap resumes an unfocused session
+ × dismisses when a card row's time tap resumes an unfocused session
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+      Tests  2 failed | 14 passed (16)
+```
+
+2. Exclusion reduced to the handle only (no `[data-pr-link]`). The PR chip
+   test fails, so that exclusion is load-bearing:
+
+```
+ × keeps the drawer for a card row's PR chip (stops its click: no resume)
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+      Tests  1 failed | 15 passed (16)
+```
+
+**Smoke flake found and fixed.** In the first batch of three smokes, run 2
+failed in the phone composer step: `[phone] composer not usable`.
+- A probe showed the composer's editor element is **replaced once** while
+  the restored session boots: mounts at `[0, 572]` and `[0, 931]` ms after
+  the composer first appears. Text typed into the first editor is
+  discarded with it; focus had landed on the doomed element.
+- This is the unchanged upstream renderer's boot sequence, not the drawer
+  change.
+- The smoke now types only after the same editor element has stayed mounted
+  for 1.5 s, up to 15 s (`scripts/smoke.mjs:277-306`). If it never settles,
+  that's reported as `the composer editor kept remounting for 15s`.
+- After that: **5 consecutive** green runs.
+
+**Gates** (final code, in order, all exit 0):
+
+```
+npm run typecheck                                        → exit 0
+npm run build                                            → exit 0
+npx vitest run src/platform src/app/open-session.test.ts → exit 0
+  Test Files  4 passed (4)
+  Tests  60 passed (60)
+node --test scripts/smoke-classifier.test.mjs            → exit 0
+  # tests 8
+  # pass 8
+  # fail 0
+node scripts/smoke.mjs …                                 → exit 0, 5 consecutive runs (after the
+                                                           composer-stability fix; first batch: 2/3)
+```
+
+Final smoke run, verbatim (token redacted):
+
+```
+screenshot: /tmp/smoke-out/1-onboarding.png
+[tablet] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+[tablet] first-run overlay: provider picker after 2.7s (gateway has no model provider) → skipped
+[tablet] thread list: switched Smoke alpha → Smoke beta → Smoke alpha, transcripts followed
+screenshot: /tmp/smoke-out/2-connected-1280.png
+screenshot: /tmp/smoke-out/3-connected-tablet-820.png
+[phone] first-run overlay: none (provider configured or previously skipped)
+screenshot: /tmp/smoke-out/4-connected-phone-390.png
+[phone] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+[phone] thread list: switched Smoke alpha → Smoke beta → Smoke alpha, transcripts followed
+screenshot: /tmp/smoke-out/5-phone-drawer-open.png
+screenshot: /tmp/smoke-out/6-phone-settings.png
+screenshot: /tmp/smoke-out/7-phone-capabilities.png
+screenshot: /tmp/smoke-out/8-phone-onboarding.png
+[phone] first-run overlay: none (provider configured or previously skipped)
+[phone] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+screenshot: /tmp/smoke-out/9-phone-drawer-project.png
+[phone] drawer browsing: project drill-in and "All projects" kept the drawer open
+[phone] first-run overlay: none (provider configured or previously skipped)
+[phone] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+screenshot: /tmp/smoke-out/10-phone-drawer-two-open-sessions.png
+[phone] focus switch: Smoke beta → already-open Smoke alpha (no route change) dismissed the drawer
+page errors: 0 (none tolerated)
+SMOKE OK: onboarding → connected chat surface (tablet + phone), thread-list switching works, zero page errors, zero bridge errors
+exit=0
+```
+
 ### Round 14 (2026-10-23): a reorder-handle tap no longer dismisses the drawer
 
 **What regressed (round 13, b19d919).**
@@ -278,7 +411,10 @@ Run `npm run build` before every smoke: a stale `dist/` serves a blank page
 - At pointerdown, a press inside `[data-reorder-handle], [data-row-actions]`
   is **not** a press on the row itself. That is the exact predicate
   `session-row.tsx:396` already uses to keep its drag gesture off those
-  controls, which are the only nested non-resume controls. The `grep
+  controls, which are the only nested non-resume controls. *(Round 15
+  correction: wrong. `[data-row-actions]` marks a region excluded from
+  **drag**, not from selection. In card mode its kebab and timestamp sit
+  inside the body and DO resume. Round 15 narrows the exclusion.)* The `grep
   stopPropagation` over `sidebar/chrome.tsx` and `session-row.tsx` finds:
   - the handle (`chrome.tsx:349`);
   - the header "+" buttons (`:81`), which aren't in session rows;

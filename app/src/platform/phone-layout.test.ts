@@ -148,9 +148,15 @@ describe('phone drawer dismissal', () => {
     header.innerHTML = `${GRAB}<span>ctx</span>`
     const actions = document.createElement('div')
     actions.dataset.rowActions = ''
+    // session-row.tsx:233-241 (focusable <time>), the trailing PR chip
+    // (pr-tag.tsx: data-pr-link, stops its click) and the ⋯ kebab — all in the
+    // actions cluster, which card mode nests inside the body (:553-566).
+    const time = Object.assign(document.createElement('time'), { textContent: '2h', tabIndex: 0 })
+    const pr = Object.assign(document.createElement('button'), { textContent: '#12' })
+    pr.dataset.prLink = ''
     const kebab = Object.assign(document.createElement('button'), { textContent: '⋯' })
     kebab.setAttribute('aria-label', 'Session actions')
-    actions.append(kebab)
+    actions.append(time, pr, kebab)
     header.append(actions)
     const label = Object.assign(document.createElement('span'), { textContent: 'Smoke alpha' })
     label.dataset.label = ''
@@ -165,12 +171,20 @@ describe('phone drawer dismissal', () => {
     const handle = overlay.querySelector('[data-reorder-handle]')!
     let resumed = 0
     handle.addEventListener('click', event => event.stopPropagation())
+    overlay.querySelector('[data-pr-link]')?.addEventListener('click', event => event.stopPropagation())
     row.addEventListener('click', () => {
       resumed++
       row.parentElement!.className = 'grid bg-(--ui-row-active-background)'
     })
 
-    return { handle, label: row.querySelector('[data-label]')!, resumed: () => resumed }
+    return {
+      handle,
+      kebab: overlay.querySelector('[aria-label="Session actions"]')!,
+      label: row.querySelector('[data-label]')!,
+      pr: overlay.querySelector('[data-pr-link]'),
+      resumed: () => resumed,
+      time: overlay.querySelector('time')
+    }
   }
 
   const rowIn = (layout: 'card' | 'compact', shellClass: string) => {
@@ -214,6 +228,41 @@ describe('phone drawer dismissal', () => {
       expect(closes).toBeGreaterThan(0)
     })
   }
+
+  // Round 15: the row-actions cluster is NOT excluded. In card mode it sits
+  // inside the body, and its kebab and timestamp clicks bubble to onResume —
+  // real selections, focus-only here (no URL change).
+  for (const target of ['kebab', 'time'] as const) {
+    it(`dismisses when a card row's ${target} tap resumes an unfocused session`, async () => {
+      const row = wireRow(rowIn('card', 'bg-(--ui-row-open-background)'))
+
+      press(row[target]!)
+      await settle()
+
+      expect(row.resumed()).toBe(1)
+      expect(closes).toBeGreaterThan(0)
+    })
+  }
+
+  it("keeps the drawer for the compact row's kebab (outside the RowButton: no resume)", async () => {
+    const row = wireRow(rowIn('compact', 'bg-(--ui-row-open-background)'))
+
+    press(row.kebab)
+    await settle()
+
+    expect(row.resumed()).toBe(0)
+    expect(closes).toBe(0)
+  })
+
+  it("keeps the drawer for a card row's PR chip (stops its click: no resume)", async () => {
+    const row = wireRow(rowIn('card', 'bg-(--ui-row-open-background)'))
+
+    press(row.pr!)
+    await settle()
+
+    expect(row.resumed()).toBe(0)
+    expect(closes).toBe(0)
+  })
 
   it('closes on a tap outside, and does nothing at tablet width', async () => {
     drawer(SESSION_ROW('Smoke alpha'))
