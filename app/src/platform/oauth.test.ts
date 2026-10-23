@@ -180,6 +180,8 @@ describe('starting a sign-in', () => {
     expect(url.searchParams.get('state')).toBe(pending.state)
     expect(pending.baseUrl).toBe(BASE)
     expect(url.searchParams.get('code_challenge')).toBe(createHash('sha256').update(pending.verifier).digest('base64url'))
+    // Native binds the callback to exactly this state and redirect (SignInSession).
+    expect(navigate.mock.calls[0][1]).toEqual({ state: pending.state, redirectUri: OAUTH_REDIRECT_URI })
   })
 })
 

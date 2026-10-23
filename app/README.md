@@ -165,21 +165,22 @@ state.
     requires an external browser for native-app authorization. The sign-in
     runs in the app's own WebView, so the app can observe what the user types
     on the gateway's (or IdP's) page. That is accepted for a client of the
-    user's own gateway, and **mitigated** (round 17):
-    - only the app can start sign-in mode (`HermesOauth.beginSignIn`);
-    - **every** Java object Capacitor exposes with `addJavascriptInterface`
-      (`androidBridge` on the fallback path, `CapacitorHttpAndroidInterface`,
-      `CapacitorCookiesAndroidInterface`) is removed before the foreign page
-      loads and restored before the app origin loads again;
+    user's own gateway, and **mitigated** (rounds 17–18):
+    - only the app can start sign-in mode (`HermesOauth.beginSignIn`, which
+      also hands native the expected `state` and redirect URI);
+    - every Java object Capacitor **actually** exposes with
+      `addJavascriptInterface` is recorded and removed before the foreign
+      page loads, and exactly that set is restored before the app origin
+      loads again. That set is `CapacitorHttpAndroidInterface`,
+      `CapacitorCookiesAndroidInterface`, and `androidBridge` whenever
+      Capacitor's `MessageHandler` uses the Java bridge, whatever the reason
+      (unsupported feature, legacy bridge, or a listener installation that
+      threw);
     - the modern `WebMessageListener` bridge is origin-scoped by Capacitor
       and stays as is;
-    - only the exact registered callback is intercepted.
-  
-    Not detectable: if `addWebMessageListener` threw on a WebView that
-    supports it, Capacitor falls back to `androidBridge` as a Java object.
-    That object is still removed during sign-in, but is not restored
-    afterwards, so plugins would be unavailable until restart (the port's UI
-    uses no Capacitor plugins).
+    - only the exact registered callback **carrying the expected state** is
+      completed. A redirect-shaped navigation with any other state during an
+      active sign-in is blocked, and the sign-in stays active.
   - **Logout can't revoke server-side.** `/auth/logout` only revokes cookie
     sessions. Signing out clears the tokens on the device, but the refresh
     token stays valid on the gateway until it expires (30 days for basic
@@ -297,6 +298,104 @@ Run `npm run build` before every smoke: a stale `dist/` serves a blank page
 
 ## Verification
 
+### Round 18 (2026-10-23): round-17 review fixes (tracked sources, state-bound callback, exact interface restore)
+
+**1. The native sources are tracked.** `HermesOauthPlugin.java`,
+`OauthCallback.java`, the new `SignInSession.java` and
+`src/test/java/com/bunge/hermes/{OauthCallbackTest,SignInSessionTest}.java`
+are staged (`git add`). `git status --porcelain --untracked-files=all
+app/android/app/src/` lists nothing untracked. The native gate now runs on
+a `git archive` export of the staged index, not on the working tree.
+
+**2. The callback is bound to the active authorization.**
+- `oauth.ts` passes `{ state, redirectUri }` to `navigate`, and
+  `bridge.ts` forwards it as `HermesOauth.beginSignIn({ url, state,
+  redirectUri })`.
+- `SignInSession.validate` rejects the call (nothing detached, nothing
+  loaded) unless:
+  - the state is non-empty;
+  - `redirectUri` is exactly `http://127.0.0.1/`;
+  - the URL is http(s) `…/auth/native/authorize` and carries exactly that
+    `state` and `redirect_uri`.
+- Native retains the expected state. A navigation matching the round-17
+  callback shape (`OauthCallback.match`, unchanged) completes **only** with
+  that state.
+- With any other state it is cancelled outright (`BLOCK`): not rewritten,
+  not disarmed, nothing restored, not handed to the system browser. The
+  genuine callback still completes afterwards.
+- The retained state is cleared on completion and on cancel (app origin
+  loads).
+
+**3. The exact set of interfaces is restored.**
+- `begin()` records `Host.installedInterfaces()`, removes exactly those
+  interfaces, and completion or cancellation restores exactly that set.
+- `androidBridge` is in the set whenever Capacitor's `MessageHandler`
+  speaks through the Java object. This uses Capacitor's own record:
+  `javaScriptReplyProxy` is set only when a message arrived via the
+  `WebMessageListener`. `begin()` runs right after the `beginSignIn`
+  message, so the probe reflects the transport actually in use: modern,
+  unsupported, legacy, or a listener installation that threw.
+- `CapacitorHttpAndroidInterface` and `CapacitorCookiesAndroidInterface`
+  are in the set when their plugin instances exist.
+- The round-17 `WebViewFeature` check and the `androidx.webkit` dependency
+  are gone.
+- `SignInSessionTest` also asserts that the two reflected fields
+  (`MessageHandler.javaScriptReplyProxy`, `Bridge.msgHandler`) exist on the
+  pinned Capacitor 8.5.3 classes.
+
+**Tests** (`SignInSessionTest`, pure Java, 6 tests):
+- A wrong-state callback during an active flow → BLOCK. The flow stays
+  armed, the interfaces stay detached and nothing is loaded; then the
+  genuine callback → COMPLETED with the exact interface set restored.
+- A second (and third) sign-in works after a completed callback and after
+  Back-cancellation, for both bridge configurations: modern
+  `{Http, Cookies}`, and Java bridge `{androidBridge, Http, Cookies}`. The
+  latter covers unsupported, legacy and **listener-throw**. Cancellation
+  reloads exactly once, with no reload loop.
+- Idle: nothing is intercepted. Subframes and the app origin get the
+  default handling. `begin` rejects a wrong state or redirect, a wrong
+  path, `javascript:` and an empty state.
+- Transport probe: modern → false, Java bridge → true, null handler →
+  false, unreadable → true.
+- `oauth.test.ts`: `navigate` receives `{ state: pending.state,
+  redirectUri: OAUTH_REDIRECT_URI }`.
+
+**Mutation checks** (each reverted afterwards):
+- dropping the state comparison in `onNavigation` → 1 test fails;
+- the transport probe always returning false (the round-17 gap) → 1 test
+  fails.
+
+**Gates (round 18)**
+```
+git archive $(git write-tree) → /tmp/r18-archive (tracked files only; the
+  gitignored generated capacitor-cordova-android-plugins/, assets/public and
+  capacitor.config.json copied in, node_modules symlinked)
+  ./gradlew :app:compileDebugJavaWithJavac :app:testDebugUnitTest (nix develop) → exit 0
+  OauthCallbackTest  tests=2 failures=0 errors=0
+  SignInSessionTest  tests=6 failures=0 errors=0
+  ExampleUnitTest    tests=1 failures=0 errors=0
+npm run typecheck                                    → exit 0
+npm run build                                        → exit 0
+npx vitest run src/platform src/app/open-session.test.ts → 5 files, 84 tests passed
+node --test scripts/smoke-classifier.test.mjs        → 8/8 pass
+gated-signin-e2e.mjs ×3 (127.0.0.1:19729, gated)     → exit 0, exit 0, exit 0
+smoke.mjs ×3 (token gateway 127.0.0.1:19719)         → exit 0, exit 0, exit 0
+```
+Gated e2e, run 1 (credentials/tokens redacted):
+```
+probe → gated, password provider: "Sign in" button shown
+gateway login page: /login
+loopback callback intercepted: yes; app URL cleaned: true
+saved gateway: authMode=oauth token=set refreshToken=set
+REST: 36 authed requests, 36 with exactly "Bearer <saved access token>" and no session-token header
+WebSocket: /api/ws open, receiving; token = saved access token: true
+sign-out: reloaded=true, Gateway screen=true; stored token cleared; 1/1 open pre-logout sockets closed (page + server side); 0 reopened with the old token; 0 page errors across the reload
+GATED E2E OK
+```
+The browser e2e runs the web build, where `beginSignIn` falls back to
+`navigate`. The native state binding and interface restore are covered by
+the JUnit tests above, not by an on-device run.
+
 ### Round 17 (2026-10-23): round-16 review fixes (logout, native boundary, refresh ownership, timeouts, callback matcher)
 
 **1. Logout ends the signed-in client** (`bridge.ts` `oauthLogoutConnectionConfig`).
@@ -388,6 +487,11 @@ exit=1
   persisting its pending record. A foreign `…/auth/native/authorize` no
   longer arms anything.
 - Unarmed, the client defers everything to Capacitor.
+- *(Round 18 correction: round 17 did **not** bind the callback to the
+  active authorization. Native kept only "armed", so a correct-shape
+  callback with a wrong `state` still disarmed the sign-in, reloaded the app
+  and consumed the real pending record. Round 18 retains the expected state
+  natively.)*
 
 **Tests.**
 - `src/platform/oauth.test.ts`, 24. The 6 new ones:
@@ -452,6 +556,10 @@ node --test scripts/smoke-classifier.test.mjs            → exit 0
   # fail 0
 ./gradlew :app:compileDebugJavaWithJavac :app:testDebugUnitTest (nix develop) → exit 0
   OauthCallbackTest: tests=2 failures=0 (16 URL cases)
+  (Round 18 correction: this ran on the working tree. `HermesOauthPlugin.java`,
+  `OauthCallback.java` and `OauthCallbackTest.java` were untracked, so the
+  committed 5ad85ea does NOT compile. Round 18 stages them and gates on a
+  `git archive` export of the index.)
 node scripts/gated-signin-e2e.mjs … (gated gateway)      → exit 0, 3 consecutive runs
 node scripts/smoke.mjs … (token-mode rig)                → exit 0, 3 consecutive runs
 ```
@@ -543,6 +651,9 @@ browser**, which would leave the app mid-sign-in. `GatewaySignInClient`
   the gateway's `/login`, a provider chooser or an IdP.
 - It rewrites the loopback callback `http://127.0.0.1[:port]/?code=…&state=…`
   to `{app}/?oauth-code=…&oauth-state=…`.
+- *(Superseded: round 17 arms only via `HermesOauth.beginSignIn` and
+  matches only `http://127.0.0.1/`; round 18 additionally requires the
+  expected `state`. See those sections.)*
 - Everything else goes to Capacitor's default.
 - Capacitor injects its native bridge only into the app origin
   (`addDocumentStartJavaScript` with the allowed origins), so the gateway's

@@ -125,7 +125,7 @@ export async function pkceChallenge(verifier: string): Promise<string> {
  *  native HermesOauth.beginSignIn — see bridge.ts. */
 export async function startOauthLogin(
   remoteUrl: string,
-  navigate: (url: string) => Promise<void> | void
+  navigate: (url: string, expected: { state: string; redirectUri: string }) => Promise<void> | void
 ): Promise<void> {
   const baseUrl = normalizeRemoteBaseUrl(remoteUrl)
   const verifier = randomToken()
@@ -140,7 +140,9 @@ export async function startOauthLogin(
   localStorage.setItem(OAUTH_PENDING_KEY, JSON.stringify(pending))
 
   try {
-    await navigate(`${baseUrl}/auth/native/authorize?${query}`)
+    // Native retains the expected state/redirect and completes only that
+    // callback (SignInSession); a browser just navigates.
+    await navigate(`${baseUrl}/auth/native/authorize?${query}`, { state: pending.state, redirectUri: OAUTH_REDIRECT_URI })
   } catch (error) {
     localStorage.removeItem(OAUTH_PENDING_KEY)
     throw error

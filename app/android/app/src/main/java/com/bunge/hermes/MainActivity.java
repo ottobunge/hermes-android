@@ -1,17 +1,17 @@
 package com.bunge.hermes;
 
 import android.graphics.Bitmap;
-import android.net.Uri;
 import android.os.Bundle;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebView;
-import androidx.webkit.WebViewFeature;
 import com.getcapacitor.Bridge;
 import com.getcapacitor.BridgeActivity;
 import com.getcapacitor.BridgeWebViewClient;
 import com.getcapacitor.Logger;
 import com.getcapacitor.PluginHandle;
 import java.lang.reflect.Field;
+import java.util.LinkedHashSet;
+import java.util.Set;
 
 public class MainActivity extends BridgeActivity {
 
@@ -23,125 +23,104 @@ public class MainActivity extends BridgeActivity {
     }
 
     /**
-     * Gated-gateway sign-in (src/platform/oauth.ts, RFC 8252 native flow, run in this
-     * WebView — an embedded user agent, an accepted deviation from RFC 8252 §8.12; see the
-     * README).
+     * Gated-gateway sign-in (src/platform/oauth.ts, the gateway's RFC 8252 native-app endpoints,
+     * run in this WebView — an embedded user agent, an accepted deviation from RFC 8252 §8.12;
+     * see the README). The decisions live in {@link SignInSession} (pure Java, unit-tested);
+     * this class adapts them to the WebView.
      *
-     * Trust boundary: no callable native interface while a non-app document is in the main
-     * frame. Capacitor exposes the app to native through (a) a WebMessageListener scoped to
-     * the app origin on modern WebViews, and (b) Java objects added with
-     * addJavascriptInterface, which Android exposes to EVERY origin: "androidBridge" when the
-     * listener is unavailable (MessageHandler fallback), and the always-registered
-     * "CapacitorHttpAndroidInterface" / "CapacitorCookiesAndroidInterface". begin() removes
-     * all (b) objects before loading the gateway — a removal takes effect at that next load —
-     * and they are added back before the app origin loads again.
-     *
-     * Sign-in mode is armed ONLY by begin() (HermesOauthPlugin.beginSignIn, called by the
-     * app after it persisted its pending PKCE/state record). While armed, main-frame http(s)
-     * navigation stays in the WebView (gateway /login, provider chooser, upstream IdP)
-     * instead of Capacitor's system-browser hand-off, and exactly the registered redirect
-     * http://127.0.0.1/?code=…&state=… (OauthCallback) is rewritten to
-     * {app}/?oauth-code=…&oauth-state=…. Unarmed, nothing here intercepts anything.
+     * Trust boundary: no callable native Java object while a non-app document is in the main
+     * frame. Capacitor exposes, via addJavascriptInterface (visible to EVERY origin):
+     * "androidBridge" whenever its MessageHandler uses the Java bridge (WebMessageListener
+     * unsupported, legacy bridge, or listener installation threw), and the always-registered
+     * "CapacitorHttpAndroidInterface" / "CapacitorCookiesAndroidInterface". The origin-scoped
+     * WebMessageListener bridge is left alone. begin() removes exactly the installed set before
+     * loading the gateway and restores exactly that set before the app origin loads again.
      */
     static final class GatewaySignInClient extends BridgeWebViewClient {
 
-        private static final String[] JS_INTERFACES = {
-            "androidBridge",
-            "CapacitorHttpAndroidInterface",
-            "CapacitorCookiesAndroidInterface"
-        };
-
         private final Bridge bridge;
-        private boolean signingIn = false;
-        private boolean detached = false;
+        private WebView view;
+        private final SignInSession session;
 
         GatewaySignInClient(Bridge bridge) {
             super(bridge);
             this.bridge = bridge;
+            this.view = bridge.getWebView();
+            this.session = new SignInSession(new WebViewHost(), bridge.getAppUrl());
         }
 
-        void begin(WebView view, String authorizeUrl) {
-            detach(view);
-            signingIn = true;
-            view.loadUrl(authorizeUrl);
+        /** HermesOauthPlugin.beginSignIn, on the main thread. */
+        void begin(WebView view, String authorizeUrl, String state, String redirectUri) {
+            this.view = view;
+            session.begin(authorizeUrl, state, redirectUri);
         }
 
         @Override
         public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-            if (!signingIn || !request.isForMainFrame()) {
-                return super.shouldOverrideUrlLoading(view, request);
+            this.view = view;
+            switch (session.onNavigation(request.getUrl().toString(), request.isForMainFrame())) {
+                case STAY:
+                    return false;
+                case BLOCK:
+                case COMPLETED:
+                    return true;
+                default:
+                    return super.shouldOverrideUrlLoading(view, request);
             }
-
-            OauthCallback callback = OauthCallback.match(request.getUrl().toString());
-            if (callback != null) {
-                signingIn = false;
-                attach(view); // before the app load: added objects appear at the next load
-                Uri app = Uri.parse(bridge.getAppUrl());
-                Uri back = new Uri.Builder()
-                    .scheme(app.getScheme())
-                    .encodedAuthority(app.getEncodedAuthority())
-                    .path("/")
-                    .appendQueryParameter("oauth-code", callback.code)
-                    .appendQueryParameter("oauth-state", callback.state)
-                    .build();
-                view.loadUrl(back.toString());
-                return true;
-            }
-
-            Uri url = request.getUrl();
-            boolean http = "http".equals(url.getScheme()) || "https".equals(url.getScheme());
-            if (http && !isAppOrigin(url)) {
-                return false; // stay in the (detached) WebView
-            }
-
-            return super.shouldOverrideUrlLoading(view, request);
         }
 
         @Override
         public void onPageStarted(WebView view, String url, Bitmap favicon) {
-            if (url != null && isAppOrigin(Uri.parse(url))) {
-                // Back in the app without a callback (Back out of the login page): disarm, and
-                // if the interfaces are still detached, restore them and reload once so this
-                // app document has them.
-                signingIn = false;
-                if (detached) {
-                    attach(view);
-                    view.post(view::reload);
-                }
+            this.view = view;
+            // Back in the app without a callback (Back out of the login page): disarm, restore
+            // the interfaces, and reload once so this app document has them.
+            if (url != null && session.isAppOrigin(url) && session.onAppOriginStarted()) {
+                view.post(view::reload);
             }
             super.onPageStarted(view, url, favicon);
         }
 
-        private void detach(WebView view) {
-            for (String name : JS_INTERFACES) {
-                view.removeJavascriptInterface(name); // no-op when absent
-            }
-            detached = true;
-        }
+        private final class WebViewHost implements SignInSession.Host {
 
-        private void attach(WebView view) {
-            if (!detached) {
-                return;
+            @Override
+            public Set<String> installedInterfaces() {
+                Set<String> names = new LinkedHashSet<>();
+                if (javaBridgeInUse()) {
+                    names.add("androidBridge");
+                }
+                if (plugin("CapacitorHttp") != null) {
+                    names.add("CapacitorHttpAndroidInterface");
+                }
+                if (plugin("CapacitorCookies") != null) {
+                    names.add("CapacitorCookiesAndroidInterface");
+                }
+                return names;
             }
-            detached = false;
-            // Mirror MessageHandler: "androidBridge" is a Java object only on the fallback path.
-            // (If addWebMessageListener threw on a supporting WebView, Capacitor also falls back;
-            // that case is not detectable here and is documented in the README.)
-            if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER) || bridge.getConfig().isUsingLegacyBridge()) {
-                Object handler = messageHandler();
-                if (handler != null) {
-                    view.addJavascriptInterface(handler, "androidBridge");
+
+            @Override
+            public void removeInterface(String name) {
+                view.removeJavascriptInterface(name);
+            }
+
+            @Override
+            public void restoreInterface(String name) {
+                Object target =
+                    "androidBridge".equals(name)
+                        ? messageHandler()
+                        : plugin("CapacitorHttpAndroidInterface".equals(name) ? "CapacitorHttp" : "CapacitorCookies");
+                if (target != null) {
+                    view.addJavascriptInterface(target, name);
                 }
             }
-            addPlugin(view, "CapacitorHttp", "CapacitorHttpAndroidInterface");
-            addPlugin(view, "CapacitorCookies", "CapacitorCookiesAndroidInterface");
+
+            @Override
+            public void load(String url) {
+                view.loadUrl(url);
+            }
         }
 
-        private void addPlugin(WebView view, String pluginId, String name) {
-            PluginHandle handle = bridge.getPlugin(pluginId);
-            if (handle != null && handle.getInstance() != null) {
-                view.addJavascriptInterface(handle.getInstance(), name);
-            }
+        private boolean javaBridgeInUse() {
+            return SignInSession.javaBridgeInUse(messageHandler());
         }
 
         private Object messageHandler() {
@@ -150,19 +129,14 @@ public class MainActivity extends BridgeActivity {
                 field.setAccessible(true);
                 return field.get(bridge);
             } catch (ReflectiveOperationException e) {
-                Logger.error("HermesOauth: cannot restore androidBridge", e);
+                Logger.error("HermesOauth: cannot reach MessageHandler", e);
                 return null;
             }
         }
 
-        private boolean isAppOrigin(Uri url) {
-            Uri app = Uri.parse(bridge.getAppUrl());
-            return (
-                app.getScheme() != null &&
-                app.getScheme().equals(url.getScheme()) &&
-                app.getEncodedAuthority() != null &&
-                app.getEncodedAuthority().equals(url.getEncodedAuthority())
-            );
+        private Object plugin(String pluginId) {
+            PluginHandle handle = bridge.getPlugin(pluginId);
+            return handle != null ? handle.getInstance() : null;
         }
     }
 }

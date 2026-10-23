@@ -313,14 +313,16 @@ async function testAndReload(gateway: SavedGateway) {
 // Android: MainActivity's HermesOauthPlugin. Native starts the sign-in itself
 // (detaching every native JS interface, then loading the authorize URL), and
 // only this call can put the WebView into sign-in mode — never a foreign page.
-const HermesOauth = registerPlugin<{ beginSignIn(options: { url: string }): Promise<void> }>('HermesOauth')
+const HermesOauth = registerPlugin<{
+  beginSignIn(options: { url: string; state: string; redirectUri: string }): Promise<void>
+}>('HermesOauth')
 
 export const pageLifecycle = {
   reload: () => window.location.reload(),
   navigate: (url: string) => window.location.assign(url),
   // A desktop browser (npm run dev/preview, the e2e) has no native shell.
-  beginSignIn: (url: string): Promise<void> | void =>
-    Capacitor.isNativePlatform() ? HermesOauth.beginSignIn({ url }) : pageLifecycle.navigate(url)
+  beginSignIn: (url: string, expected: { state: string; redirectUri: string }): Promise<void> | void =>
+    Capacitor.isNativePlatform() ? HermesOauth.beginSignIn({ url, ...expected }) : pageLifecycle.navigate(url)
 }
 
 function applyAndReload(gateway: SavedGateway) {
