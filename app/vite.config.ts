@@ -207,7 +207,13 @@ export default defineConfig(({ command }) => ({
     ]
   },
   resolve: {
-    alias: {
+    alias: [
+      // Android port: the vendored styles.css reaches package assets through
+      // the monorepo root (`../../../node_modules/…`, e.g. the Collapse
+      // wordmark font). This app installs its own node_modules — point those
+      // relative package URLs there so the build emits them.
+      { find: /^(?:\.\.\/)+node_modules\//, replacement: `${path.resolve(__dirname, 'node_modules')}/` },
+      ...Object.entries({
       '@/debug/dev-only': debugEntry(command, process.env as Record<string, string>),
       '@': path.resolve(__dirname, './src'),
       '@hermes/plugin-sdk': path.resolve(__dirname, './src/sdk/index.ts'),
@@ -232,7 +238,8 @@ export default defineConfig(({ command }) => ({
       'react-dom': reactDomDir,
       'react/jsx-dev-runtime': path.join(reactDir, 'jsx-dev-runtime.js'),
       'react/jsx-runtime': path.join(reactDir, 'jsx-runtime.js')
-    },
+      }).map(([find, replacement]) => ({ find, replacement }))
+    ],
     dedupe: ['react', 'react-dom', 'react-router', '@tanstack/react-query']
   },
   server: {

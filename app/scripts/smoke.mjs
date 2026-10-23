@@ -30,11 +30,27 @@ if (!args.gateway || !args.token) {
 fs.mkdirSync(args.out, { recursive: true })
 
 const problems = []
+const known = new Map()
 const browser = await chromium.launch({ executablePath: args.chromium, headless: true })
 
-function watch(page, label) {
-  page.on('pageerror', error => problems.push(`[${label}] pageerror: ${error.message}`))
+// The one tolerated pageerror: upstream's assistant-ui thread-list render loop,
+// reproduced in the unmodified upstream Electron app (README "Upstream
+// comparison"). Exact-message match only — anything else still fails.
+const KNOWN_UPSTREAM_PAGEERROR =
+  'Maximum update depth exceeded. The result of getSnapshot should be cached to avoid an infinite loop.'
+
+// One listener set per page; `phase.label` moves with the run so a page's
+// errors are attributed (and counted) once.
+function watch(page, phase) {
+  page.on('pageerror', error => {
+    if (error.message === KNOWN_UPSTREAM_PAGEERROR) {
+      known.set(phase.label, (known.get(phase.label) ?? 0) + 1)
+    } else {
+      problems.push(`[${phase.label}] pageerror: ${error.message}`)
+    }
+  })
   page.on('console', msg => {
+    const label = phase.label
     const text = msg.text()
 
     if (msg.type() === 'error') {
@@ -56,7 +72,8 @@ async function shot(page, name) {
 // 1–2. Onboarding through the real Gateway settings form.
 const context = await browser.newContext({ viewport: { width: 1280, height: 800 } })
 const page = await context.newPage()
-watch(page, 'onboarding')
+const desktop = { label: 'onboarding' }
+watch(page, desktop)
 await page.goto(args.app)
 await page.getByText('Connect to a Hermes gateway').waitFor({ timeout: 30_000 })
 await page.getByPlaceholder('https://gateway.example.com/hermes').fill(args.gateway)
@@ -80,19 +97,40 @@ async function assertConnected(p, label) {
   }
 }
 
-watch(page, 'tablet')
+desktop.label = 'tablet'
 await assertConnected(page, 'tablet')
+
+// Production build ships the wordmark face (resolved from app/node_modules).
+const fontFaces = await page.evaluate(async () => (await document.fonts.load('700 32px Collapse')).length)
+if (!fontFaces) {
+  problems.push('[tablet] Collapse wordmark font did not load')
+}
+
+// Electron <webview> previews fail explicitly on Android (webview-unavailable.ts).
+const webviewFailure = await page.evaluate(
+  () =>
+    new Promise(resolve => {
+      const webview = document.createElement('webview')
+      webview.setAttribute('src', 'https://example.com/')
+      webview.addEventListener('did-fail-load', event => resolve(event.errorDescription || ''))
+      setTimeout(() => resolve(''), 2_000)
+    })
+)
+if (!/not available on Android/.test(String(webviewFailure))) {
+  problems.push('[tablet] <webview> preview did not report unavailable')
+}
 await page.waitForTimeout(2_000)
 await shot(page, '2-connected-1280')
 
 await page.setViewportSize({ width: 820, height: 1180 })
+await assertConnected(page, 'tablet-820')
 await page.waitForTimeout(1_000)
 await shot(page, '3-connected-tablet-820')
 
 const storage = await context.storageState()
 const phone = await browser.newContext({ viewport: { width: 390, height: 844 }, storageState: storage, hasTouch: true, isMobile: true })
 const phonePage = await phone.newPage()
-watch(phonePage, 'phone')
+watch(phonePage, { label: 'phone' })
 await phonePage.goto(args.app)
 // Phone: the sessions sidebar is a drawer (not mounted until opened), so the
 // connected surface is the composer + the titlebar's sidebar toggle.
@@ -124,9 +162,16 @@ if (overflow > 0) {
 
 await browser.close()
 
+for (const [label, count] of known) {
+  console.log(`[${label}] known upstream pageerror ×${count} (tolerated): ${KNOWN_UPSTREAM_PAGEERROR}`)
+}
+
 if (problems.length) {
   console.error(`SMOKE FAILED:\n${problems.join('\n')}`)
   process.exit(1)
 }
 
-console.log('SMOKE OK: onboarding → connected chat surface (tablet + phone), zero uncaught bridge errors')
+console.log(
+  'SMOKE OK: onboarding → connected chat surface (tablet + phone), no pageerrors beyond the known upstream one, ' +
+    'zero bridge errors'
+)

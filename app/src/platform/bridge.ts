@@ -28,6 +28,7 @@ import {
   hostLabel,
   loadGateway,
   normalizeRemoteBaseUrl,
+  resolveGatewayEdit,
   type SavedGateway,
   saveGateway,
   tokenPreview
@@ -52,8 +53,26 @@ function unsupported(): Promise<never> {
   return Promise.reject(new Error(UNSUPPORTED))
 }
 
+// The gateway this page booted with. REST and the WebSocket both resolve from
+// it, so a save can never split them across two servers: a saved change takes
+// effect only through a reload (applyAndReload) — the page IS the client.
+let activeGateway: SavedGateway | null | undefined
+
+function bootGateway(): SavedGateway | null {
+  if (activeGateway === undefined) {
+    activeGateway = loadGateway()
+  }
+
+  return activeGateway
+}
+
+/** Test seam: forget the booted gateway so the next call re-reads storage. */
+export function resetActiveGatewayForTests(): void {
+  activeGateway = undefined
+}
+
 function requireGateway(): SavedGateway {
-  const gateway = loadGateway()
+  const gateway = bootGateway()
 
   if (!gateway) {
     throw new Error('No Hermes gateway is configured. Open Settings → Gateway to connect one.')
@@ -154,26 +173,24 @@ function assertRemote(input: DesktopConnectionConfigInput) {
 
 function coerce(input: DesktopConnectionConfigInput): SavedGateway {
   assertRemote(input)
-  const existing = loadGateway()
-  const httpUrl = normalizeRemoteBaseUrl(input.remoteUrl ?? existing?.httpUrl ?? '')
-  // Same token inheritance as Electron: omitted token keeps the saved one for the same host.
-  const token = input.remoteToken?.trim() || (existing?.httpUrl === httpUrl ? existing?.token : undefined)
 
-  return { name: existing?.name || hostLabel(httpUrl), httpUrl, token }
+  return resolveGatewayEdit(loadGateway(), { url: input.remoteUrl, token: input.remoteToken })
 }
 
-/** Mirrors Electron's test: authed /api/status, then the live /api/ws leg. */
+/** Mirrors Electron's test: /api/status, then the token on a guarded route
+ *  and the live /api/ws leg. /api/status is public, so reachability alone
+ *  never certifies a usable connection — no token, no success. */
 async function testGateway(gateway: SavedGateway): Promise<DesktopConnectionTestResult> {
   const baseUrl = normalizeRemoteBaseUrl(gateway.httpUrl)
 
   try {
-    const status = await fetchStatus(baseUrl, gateway)
-
-    if (gateway.token) {
-      // /api/status is public; prove the token on a guarded route.
-      await gatewayApi(gateway, { path: '/api/sessions?limit=1', timeoutMs: 8_000 }, baseUrl)
-      await probeWebSocket(buildGatewayWsUrl(baseUrl, gateway.token))
+    if (!gateway.token) {
+      throw new Error('A session token is required to connect to this gateway.')
     }
+
+    const status = await fetchStatus(baseUrl, gateway)
+    await gatewayApi(gateway, { path: '/api/sessions?limit=1', timeoutMs: 8_000 }, baseUrl)
+    await probeWebSocket(buildGatewayWsUrl(baseUrl, gateway.token))
 
     return { ok: true, reachable: true, baseUrl, version: status?.version || null }
   } catch (error) {
@@ -197,6 +214,7 @@ function probeWebSocket(url: string, timeoutMs = 8_000): Promise<void> {
     }
     ws.onerror = () => {
       clearTimeout(timer)
+      ws.close()
       reject(new Error('Reached the gateway over HTTP, but the live WebSocket (/api/ws) connection failed.'))
     }
   })
@@ -227,6 +245,16 @@ function registry(): DesktopConnectionsRegistry {
 
 // Applying a new gateway is a hard re-home here (window reload) rather than
 // Electron's soft in-place re-dial — the whole page IS the backend client.
+async function testAndReload(gateway: SavedGateway) {
+  const result = await testGateway(gateway)
+
+  if (!result.ok) {
+    throw new Error(result.error || 'Could not connect to the Hermes gateway.')
+  }
+
+  applyAndReload(gateway)
+}
+
 function applyAndReload(gateway: SavedGateway) {
   saveGateway(gateway)
   setTimeout(() => window.location.reload(), 400)
@@ -302,7 +330,7 @@ export const bridge: Bridge = {
   getGatewayWsUrl: async () => wsUrlResult(),
   getGatewayWsUrlFor: async () => wsUrlResult(),
   revalidateConnection: async () => {
-    const gateway = loadGateway()
+    const gateway = bootGateway()
 
     if (!gateway) {
       return { ok: false, rebuilt: false }
@@ -331,24 +359,28 @@ export const bridge: Bridge = {
 
   // ── Connection settings (drives the reused Settings → Gateway panel) ──────
   getConnectionConfig: async () => connectionConfig(),
+  // Persists for the next boot; the running page keeps its booted gateway.
   saveConnectionConfig: async input => {
     saveGateway(coerce(input))
 
     return connectionConfig()
   },
   applyConnectionConfig: async input => {
-    const gateway = coerce(input)
-    const result = await testGateway(gateway)
-
-    if (!result.ok) {
-      throw new Error(result.error || 'Could not connect to the Hermes gateway.')
-    }
-
-    applyAndReload(gateway)
+    await testAndReload(coerce(input))
 
     return connectionConfig()
   },
-  testConnectionConfig: async input => testGateway(coerce(input)),
+  testConnectionConfig: async input => {
+    let gateway: SavedGateway
+
+    try {
+      gateway = coerce(input)
+    } catch (error) {
+      return { ok: false, reachable: false, baseUrl: input.remoteUrl ?? '', error: (error as Error).message }
+    }
+
+    return testGateway(gateway)
+  },
   probeConnectionConfig: async remoteUrl => {
     const baseUrl = normalizeRemoteBaseUrl(remoteUrl)
 
@@ -381,8 +413,17 @@ export const bridge: Bridge = {
       }
 
       const current = loadGateway()
-      const httpUrl = normalizeRemoteBaseUrl(input.url ?? current?.httpUrl ?? '')
-      saveGateway({ name: input.label, httpUrl, token: input.token?.trim() || current?.token })
+      const next = resolveGatewayEdit(current, { url: input.url, token: input.token, name: input.label })
+      const material = !current || next.httpUrl !== normalizeRemoteBaseUrl(current.httpUrl) || next.token !== current.token
+
+      if (material) {
+        // Endpoint or credential changed: same validate → save → reload as
+        // Settings → Gateway, so REST and the live socket move together.
+        await testAndReload(next)
+      } else {
+        saveGateway(next)
+      }
+
       const reg = registry()
 
       return { ok: true, connection: reg.connections[0], registry: reg }
@@ -524,8 +565,9 @@ export const bridge: Bridge = {
     }
   },
   claimAmbientCue: async () => true,
-  normalizePreviewTarget: async target =>
-    /^https?:\/\//i.test(target) ? { kind: 'url', label: target, source: target, url: target } : null,
+  // No native preview classification: there is no Electron <webview> guest
+  // on Android (see webview-unavailable.ts), so nothing is advertised here.
+  normalizePreviewTarget: async () => null,
 
   // ── Desktop-OS capabilities: unavailable answers ──────────────────────────
   openSessionWindow: async () => ({ ok: false, error: UNSUPPORTED }),

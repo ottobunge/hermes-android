@@ -4,12 +4,11 @@ const config: CapacitorConfig = {
   appId: 'com.bunge.hermes',
   appName: 'Hermes',
   webDir: 'dist',
-  android: {
-    // Self-hosted gateways are often plain http:// on a LAN/tailnet; the page
-    // itself stays on the secure https://localhost origin (which the gateway's
-    // CORS policy already admits).
-    allowMixedContent: true
-  }
+  // Network policy is deliberately unset until the native project exists:
+  // HTTPS/WSS gateways are the supported path. Plain http:// on Android needs
+  // an explicit cleartext policy (server.cleartext / networkSecurityConfig),
+  // which `allowMixedContent` does NOT provide — decide it when android/ is
+  // generated (README "Deviations").
 }
 
 export default config

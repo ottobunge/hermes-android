@@ -5,8 +5,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { isMissingRestEndpoint } from '@/lib/gateway-rpc'
 
 import { gatewayApi } from './api-transport'
-import { bridge } from './bridge'
-import { buildGatewayWsUrl, normalizeRemoteBaseUrl, pathWithProfileScope, saveGateway } from './gateway-config'
+import { bridge, resetActiveGatewayForTests } from './bridge'
+import {
+  buildGatewayWsUrl,
+  loadGateway,
+  normalizeRemoteBaseUrl,
+  pathWithProfileScope,
+  saveGateway
+} from './gateway-config'
 
 const gw = { name: 'box', httpUrl: 'http://box:9119', token: 'tok en' }
 
@@ -15,9 +21,21 @@ function respond(status: number, body: string, headers: Record<string, string> =
 }
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.unstubAllGlobals()
   localStorage.clear()
+  resetActiveGatewayForTests()
 })
+
+/** A WebSocket that opens immediately (the /api/ws leg of a connection test). */
+class OpenSocket {
+  onopen: (() => void) | null = null
+  onerror: (() => void) | null = null
+  constructor() {
+    setTimeout(() => this.onopen?.())
+  }
+  close() {}
+}
 
 describe('gateway config', () => {
   it('normalizes URLs like Electron', () => {
@@ -86,6 +104,85 @@ describe('gatewayApi', () => {
         new Promise((_resolve, reject) => init.signal!.addEventListener('abort', () => reject(new Error('aborted'))))
     )
     await expect(gatewayApi(gw, { path: '/api/x', timeoutMs: 20 }, 'http://box:9119')).rejects.toThrow(/Timed out/)
+  })
+
+  it('times out a response whose headers arrived but whose body stalls', async () => {
+    const stalled = { status: 200, type: 'basic', headers: new Headers(), text: () => new Promise<string>(() => {}) }
+    vi.stubGlobal('fetch', async () => stalled)
+
+    await expect(gatewayApi(gw, { path: '/api/x', timeoutMs: 20 }, 'http://box:9119')).rejects.toThrow(
+      /Timed out reading/
+    )
+  })
+})
+
+describe('gateway edits (credential isolation + connection switch)', () => {
+  const a = { name: 'A', httpUrl: 'https://a.example', token: 'A-secret' }
+
+  it('never carries a token to a different endpoint on either save path', async () => {
+    saveGateway(a)
+
+    await expect(
+      bridge.connections.save({ id: 'gateway', kind: 'remote', label: 'B', url: 'https://b.example' })
+    ).rejects.toThrow(/session token for b.example/)
+    await expect(
+      bridge.saveConnectionConfig({ mode: 'remote', remoteAuthMode: 'token', remoteUrl: 'https://b.example' })
+    ).rejects.toThrow(/session token for b.example/)
+    expect(loadGateway()).toEqual(a)
+  })
+
+  it('keeps the saved token for the same endpoint and saves a label-only edit in place', async () => {
+    saveGateway(a)
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+
+    await bridge.connections.save({ id: 'gateway', kind: 'remote', label: 'Renamed', url: 'https://a.example/' })
+
+    expect(loadGateway()).toEqual({ ...a, name: 'Renamed' })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('routes a material registry edit through test → save → reload', async () => {
+    saveGateway(a)
+    vi.stubGlobal('WebSocket', OpenSocket)
+    const fetchMock = vi.fn(async (_url: string, _init: RequestInit) => respond(200, '{}'))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await bridge.connections.save({ id: 'gateway', kind: 'remote', label: 'B', url: 'https://b.example', token: 'B' })
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      'https://b.example/api/status',
+      'https://b.example/api/sessions?limit=1'
+    ])
+    expect(loadGateway()).toEqual({ name: 'B', httpUrl: 'https://b.example', token: 'B' })
+  })
+
+  it('refuses to apply a gateway without a token, before any request', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(
+      bridge.applyConnectionConfig({ mode: 'remote', remoteAuthMode: 'token', remoteUrl: 'https://b.example' })
+    ).rejects.toThrow(/session token/)
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(loadGateway()).toBeNull()
+  })
+
+  it('keeps REST on the booted gateway after a save (no REST/WS split)', async () => {
+    saveGateway(a)
+    const fetchMock = vi.fn(async (_url: string, _init: RequestInit) => respond(200, '{}'))
+    vi.stubGlobal('fetch', fetchMock)
+    await bridge.getConnection()
+
+    await bridge.saveConnectionConfig({
+      mode: 'remote',
+      remoteAuthMode: 'token',
+      remoteUrl: 'https://b.example',
+      remoteToken: 'B'
+    })
+    await bridge.api({ path: '/api/config' })
+
+    expect(fetchMock.mock.calls.at(-1)?.[0]).toBe('https://a.example/api/config')
   })
 })
 

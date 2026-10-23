@@ -44,9 +44,14 @@ function closeDrawer(overlay: Element) {
   }
 }
 
+// URL when a press inside the drawer began; one delegated click handler
+// compares it after the click, so nothing is attached per gesture.
+let hrefAtPress: null | string = null
+
 function onPointerDown(event: PointerEvent) {
   const overlay = document.querySelector('[data-narrow-overlay]')
   const target = event.target as Element | null
+  hrefAtPress = null
 
   if (!overlay || !target || !window.matchMedia(SIDEBAR_COLLAPSE_MEDIA_QUERY).matches) {
     return
@@ -54,10 +59,7 @@ function onPointerDown(event: PointerEvent) {
 
   if (overlay.contains(target)) {
     // A tap that navigates (session row, nav item) hands the screen back.
-    const before = location.href
-    target.addEventListener('click', () => setTimeout(() => location.href !== before && closeDrawer(overlay)), {
-      once: true
-    })
+    hrefAtPress = location.href
 
     return
   }
@@ -71,10 +73,29 @@ function onPointerDown(event: PointerEvent) {
   closeDrawer(overlay)
 }
 
+function onClick() {
+  const before = hrefAtPress
+  hrefAtPress = null
+
+  if (before === null) {
+    return
+  }
+
+  setTimeout(() => {
+    const overlay = document.querySelector('[data-narrow-overlay]')
+
+    if (overlay && location.href !== before) {
+      closeDrawer(overlay)
+    }
+  })
+}
+
 export function installPhoneLayout(): void {
   const style = document.createElement('style')
   style.dataset.androidPhoneLayout = ''
   style.textContent = PHONE_CSS
   document.head.appendChild(style)
   document.addEventListener('pointerdown', onPointerDown, true)
+  document.addEventListener('pointercancel', () => (hrefAtPress = null), true)
+  document.addEventListener('click', onClick, true)
 }

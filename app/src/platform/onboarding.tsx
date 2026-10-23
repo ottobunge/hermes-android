@@ -28,7 +28,8 @@ function Onboarding() {
           <h1 className="text-[0.9375rem] font-semibold tracking-tight">Connect to a Hermes gateway</h1>
           <p className="mt-1 text-[0.8125rem] leading-5 text-(--ui-text-tertiary)">
             Hermes on Android is a client for a Hermes gateway running elsewhere (<code>hermes serve</code>). Enter
-            its URL and session token.
+            its URL and session token. Use an <code>https://</code> gateway: plain <code>http://</code> sends the token
+            unencrypted and is only for a network you trust.
           </p>
         </div>
         <GatewaySettings embedded />

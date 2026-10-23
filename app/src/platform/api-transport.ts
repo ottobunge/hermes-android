@@ -46,32 +46,62 @@ export function gatewayHeaders(gateway: SavedGateway): Record<string, string> {
   return gateway.token ? { 'X-Hermes-Session-Token': gateway.token } : {}
 }
 
+// Rejects when the signal aborts, even if the body promise never settles (a
+// mock or a stalled stream that ignores the abort).
+function readBody(res: Response, signal: AbortSignal): Promise<string> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      return reject(signal.reason)
+    }
+
+    signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+    res.text().then(resolve, reject)
+  })
+}
+
+// One timer spans the whole exchange — headers AND body — like main's
+// fetchJson, so a gateway that sends headers and then stalls still times out.
 async function attempt(url: string, init: RequestInit, timeoutMs: number): Promise<unknown> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   let res: Response
+  let text: string
 
   try {
-    res = await fetch(url, { ...init, redirect: 'manual', signal: controller.signal })
-  } catch (error) {
-    if (controller.signal.aborted) {
-      throw new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`)
+    try {
+      res = await fetch(url, { ...init, redirect: 'manual', signal: controller.signal })
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`)
+      }
+
+      // fetch() only rejects before a response exists: the transport failed.
+      throw Object.assign(new Error(`Could not reach Hermes gateway at ${url}: ${(error as Error).message}`), {
+        transient: true
+      })
     }
 
-    // fetch() only rejects before a response exists: the transport failed.
-    throw Object.assign(new Error(`Could not reach Hermes gateway at ${url}: ${(error as Error).message}`), {
-      transient: true
-    })
+    // redirect:'manual' surfaces a 3xx as an opaque response (status 0).
+    if (res.type === 'opaqueredirect') {
+      throw htmlResponseError(url, 302)
+    }
+
+    try {
+      text = await readBody(res, controller.signal)
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new Error(`Timed out reading the response from Hermes backend after ${timeoutMs}ms`)
+      }
+
+      // The request was answered, then the connection dropped mid-body. Only
+      // idempotent verbs are retried (gatewayApi), so this never re-submits.
+      throw Object.assign(new Error(`Lost connection to Hermes gateway reading ${url}: ${(error as Error).message}`), {
+        transient: true
+      })
+    }
   } finally {
     clearTimeout(timer)
   }
-
-  // redirect:'manual' surfaces a 3xx as an opaque response (status 0).
-  if (res.type === 'opaqueredirect') {
-    throw htmlResponseError(url, 302)
-  }
-
-  const text = await res.text()
 
   if (res.status >= 400) {
     throw httpStatusError(res.status, text || res.statusText)

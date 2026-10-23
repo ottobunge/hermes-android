@@ -5,9 +5,11 @@
 import { installBridge } from './bridge'
 import { loadGateway } from './gateway-config'
 import { installPhoneLayout } from './phone-layout'
+import { installWebviewFallback } from './webview-unavailable'
 
 installBridge()
 installPhoneLayout()
+installWebviewFallback()
 
 if (loadGateway()) {
   void import('../main')

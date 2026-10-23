@@ -67,6 +67,33 @@ export function normalizeRemoteBaseUrl(rawUrl: string): string {
   return parsed.toString().replace(/\/+$/, '')
 }
 
+/**
+ * The one rule for editing the saved gateway, shared by every save path
+ * (Settings → Gateway and the connections registry). An omitted token keeps
+ * the saved one only while the normalized endpoint is unchanged — a new
+ * endpoint must bring its own token, so a credential never follows a URL edit
+ * to a different host. Android is token-only: an edit that ends without a
+ * token is refused rather than saved as an unbootable gateway.
+ */
+export function resolveGatewayEdit(
+  existing: SavedGateway | null,
+  edit: { url?: null | string; token?: null | string; name?: null | string }
+): SavedGateway {
+  const httpUrl = normalizeRemoteBaseUrl(edit.url ?? existing?.httpUrl ?? '')
+  const sameEndpoint = Boolean(existing) && normalizeRemoteBaseUrl(existing!.httpUrl) === httpUrl
+  const token = edit.token?.trim() || (sameEndpoint ? existing!.token : undefined)
+
+  if (!token) {
+    throw new Error(
+      sameEndpoint
+        ? 'A session token is required. Enter the gateway session token.'
+        : `Enter the session token for ${hostLabel(httpUrl)} — the saved token belongs to a different gateway.`
+    )
+  }
+
+  return { name: edit.name?.trim() || (sameEndpoint ? existing!.name : '') || hostLabel(httpUrl), httpUrl, token }
+}
+
 /** Mirror of electron/connection-config.ts buildGatewayWsUrl (token auth). */
 export function buildGatewayWsUrl(baseUrl: string, token: string): string {
   const parsed = new URL(baseUrl)
