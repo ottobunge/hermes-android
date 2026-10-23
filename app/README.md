@@ -22,8 +22,9 @@ React renderer from `upstream/apps/desktop` (v0.17.6, hermes-agent 0.21.5).
   using the desktop's existing remote-connection mode.
 
 `../upstream/` is the pristine upstream reference — never edit it. Re-vendor
-it and 3-way diff against `app/src` to pick up upstream changes. Everything
-Android-specific lives in `src/platform/` (each file is headed
+it and 3-way diff against `app/src` to pick up upstream changes. The native
+Android project and sign-in adapter live in `android/`; Android-specific
+renderer code lives in `src/platform/` (each file is headed
 "Android adaptation layer"), plus `index.html` → `src/platform/entry.ts`,
 `vite.config.ts` (including an alias that resolves the vendored stylesheet's
 monorepo-relative `../../../node_modules/…` font URLs from `app/node_modules`),
@@ -31,6 +32,21 @@ monorepo-relative `../../../node_modules/…` font URLs from `app/node_modules`)
 purpose: `patches/@assistant-ui+core+0.2.23.patch`, applied by
 `patch-package` on `postinstall`. It fixes the upstream render loop; see
 "Fixed: assistant-ui thread-list render loop" below.
+
+## Working checkpoint — 2026-10-23
+
+Application code is frozen at `ffc7c33660dd2f614671fd614e8ef0b46e1b72ba`.
+The debug APK has been built and exercised on phone/tablet emulators, and the
+owner confirmed the app works. The [round-18 independent review](../reviews/arsenal-hermes-android-r18-review-cxsol.md)
+closed all three prior blockers with **APPROVED_WITH_NITS**. The earlier
+[round-16](../reviews/arsenal-hermes-android-r16-review-cxsol.md) and
+[round-17](../reviews/arsenal-hermes-android-r17-review-cxsol.md) rejections are
+retained as history, not outstanding verdicts on the final code.
+
+The remaining null-authorize-URL validation nit, embedded-login trade-off,
+desktop-only capability limits, and incomplete full-UI-suite evidence below
+are not silently waived by this working checkpoint. Production signing,
+store distribution, and upstream contribution work have not started.
 
 ## How it works
 
@@ -81,7 +97,8 @@ Every member of `window.hermesDesktop`. All non-optional members are present
 is possible from a missing required member. "Full fidelity" means the same
 behavior as Electron **within the supported single token-gateway scope**,
 not Electron's lifecycle in general. "Web equivalent" depends on browser and
-WebView capabilities and has not been verified on an Android device.
+WebView capabilities; not every individual capability has been verified on a
+physical Android device. See the working checkpoint and per-round evidence.
 
 ### Full fidelity (single gateway)
 
@@ -234,11 +251,10 @@ state.
   The port carries a one-line `patch-package` fix to `@assistant-ui/core`,
   and the smoke now tolerates **no** page errors. Root cause, fix and
   evidence are under "Verification → Render-loop fix".
-- **`app/android/` does not exist.** `npx cap add android` / `npx cap sync
-  android` were not run, so the native project is not committed yet.
-- **No Android SDK/JDK on this machine** (`java`, `sdkmanager`, `adb` absent,
-  `ANDROID_HOME` unset). `gradlew assembleDebug` was **NOT** run; no APK has
-  been built.
+- **Native project and SDK are available.** `app/android/` is committed. The
+  root Nix flake supplies JDK 21 and Android SDK platforms/build-tools 35/36;
+  debug APK builds and emulator checks have run. Older round notes below
+  describe historical gates, not the current toolchain state.
 - **Vitest:** the Electron main-process project is dropped (nothing to run it
   against). The full UI suite does not pass here — see "Verification" below.
 
@@ -258,13 +274,20 @@ npm run dev                # http://127.0.0.1:5174 (browser dev against a gatewa
 npm run preview            # serves dist/ on http://127.0.0.1:4174
 ```
 
-Android (needs JDK 21 + Android SDK with `ANDROID_HOME` set, none present here):
+Android (the root Nix shell supplies JDK 21 and `ANDROID_HOME`):
 
 ```sh
-npx cap add android        # first time only; then commit app/android/
+# From the repository root:
+nix develop
+cd app
+npm ci
 npm run android:debug      # build → cap sync android → ./gradlew assembleDebug
 # APK: android/app/build/outputs/apk/debug/app-debug.apk
 ```
+
+Do not run `cap add android` again: the native project, including its custom
+sign-in adapter, is already committed. Always sync/copy the fresh web build
+before Gradle; Gradle alone can package stale web assets.
 
 ### Boot smoke
 
@@ -276,22 +299,17 @@ node scripts/smoke.mjs --app http://127.0.0.1:4174 --gateway http://127.0.0.1:19
   --token <token> --chromium /path/to/chromium --out smoke-out
 ```
 
-A scratch gateway that doesn't touch an existing one:
+Use a separately isolated test gateway, preferably a dedicated container with
+a disposable home, private runtime/process namespace, and a loopback-only
+published port. **Do not launch a second host gateway merely by changing
+`HERMES_HOME` and the port:** Hermes also has machine-wide backend discovery,
+so that is not isolation from an existing installation.
 
-```sh
-export HERMES_HOME=$(mktemp -d) HERMES_DASHBOARD_SESSION_TOKEN=$(openssl rand -hex 24)
-hermes serve --port 19719 --skip-build &   # REST + /api/ws
-hermes gateway run &                       # initializes state.db (else /api/sessions → 503)
-# the two sessions the smoke switches between (synthetic transcripts)
-for f in scripts/smoke-sessions/alpha.jsonl scripts/smoke-sessions/beta.jsonl; do
-  hermes sessions import --from claude "$f"
-done
-hermes sessions list                       # then rename the two imported ids:
-hermes sessions rename <alpha-id> "Smoke alpha"
-hermes sessions rename <beta-id>  "Smoke beta"
-# the project the phone drawer-browsing check drills into (round 11)
-mkdir -p /tmp/smoke-project && hermes project create "Smoke project" /tmp/smoke-project
-```
+Inside the isolated rig, seed the synthetic fixtures from
+`scripts/smoke-sessions/` as sessions named `Smoke alpha` and `Smoke beta`, plus
+a project named `Smoke project`. Point the client smoke at that rig. Keep
+live gateway homes, credentials, databases, and ownership registries out of
+the test container.
 
 Run `npm run build` before every smoke: a stale `dist/` serves a blank page
 (round 9).
