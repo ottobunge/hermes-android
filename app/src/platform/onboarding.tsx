@@ -20,7 +20,9 @@ import { I18nProvider } from '@/i18n/context'
 import { queryClient } from '@/lib/query-client'
 import { ThemeProvider } from '@/themes/context'
 
-function Onboarding() {
+import { type OauthNotice, takeOauthNotice } from './oauth'
+
+function Onboarding({ notice }: { notice: OauthNotice | null }) {
   return (
     <main className="flex min-h-dvh w-full items-start justify-center overflow-y-auto bg-background px-4 py-10 text-foreground sm:items-center">
       <div className="w-full max-w-[46rem] rounded-xl border border-(--stroke-nous) bg-(--ui-chat-bubble-background) py-5 shadow-nous">
@@ -28,9 +30,21 @@ function Onboarding() {
           <h1 className="text-[0.9375rem] font-semibold tracking-tight">Connect to a Hermes gateway</h1>
           <p className="mt-1 text-[0.8125rem] leading-5 text-(--ui-text-tertiary)">
             Hermes on Android is a client for a Hermes gateway running elsewhere (<code>hermes serve</code>). Enter
-            its URL and session token. Use an <code>https://</code> gateway: plain <code>http://</code> sends the token
-            unencrypted and is only for a network you trust.
+            its URL, then its session token or sign in. Use an <code>https://</code> gateway: plain{' '}
+            <code>http://</code> sends credentials unencrypted and is only for a network you trust.
           </p>
+          {notice ? (
+            <p
+              className={
+                notice.kind === 'failed'
+                  ? 'mt-3 rounded-lg border border-destructive/35 px-3 py-2 text-[0.8125rem] text-destructive'
+                  : 'mt-3 rounded-lg border border-(--stroke-nous) px-3 py-2 text-[0.8125rem] text-(--ui-text-secondary)'
+              }
+              role={notice.kind === 'failed' ? 'alert' : 'status'}
+            >
+              {notice.message}
+            </p>
+          ) : null}
         </div>
         <GatewaySettings embedded />
       </div>
@@ -40,6 +54,9 @@ function Onboarding() {
 }
 
 export function mountOnboarding(): void {
+  // Read once: StrictMode double-renders, and the notice is one-shot.
+  const notice = takeOauthNotice()
+
   createRoot(document.getElementById('root')!).render(
     <StrictMode>
       <QueryClientProvider client={queryClient}>
@@ -47,7 +64,7 @@ export function mountOnboarding(): void {
           <ThemeProvider>
             <RootTooltipProvider>
               <HashRouter>
-                <Onboarding />
+                <Onboarding notice={notice} />
               </HashRouter>
             </RootTooltipProvider>
           </ThemeProvider>

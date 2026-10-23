@@ -8,6 +8,7 @@
 import type { HermesApiRequest } from '@/global'
 
 import { pathWithProfileScope, type SavedGateway } from './gateway-config'
+import { refreshOauthTokens } from './oauth'
 
 export const DEFAULT_FETCH_TIMEOUT_MS = 30_000
 
@@ -41,9 +42,19 @@ export function resolveTimeoutMs(timeoutMs: unknown): number {
   return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : DEFAULT_FETCH_TIMEOUT_MS
 }
 
-/** Headers for an authed gateway request (token auth: X-Hermes-Session-Token). */
+/** Headers for an authed gateway request: the static session token
+ *  (X-Hermes-Session-Token) in token mode, the native sign-in's access token
+ *  (Authorization: Bearer) in OAuth/gated mode. Never both: a gated gateway
+ *  ignores the session token, and a presented-but-invalid Bearer 401s even
+ *  where the session token alone would pass. */
 export function gatewayHeaders(gateway: SavedGateway): Record<string, string> {
-  return gateway.token ? { 'X-Hermes-Session-Token': gateway.token } : {}
+  if (!gateway.token) {
+    return {}
+  }
+
+  return gateway.authMode === 'oauth'
+    ? { Authorization: `Bearer ${gateway.token}` }
+    : { 'X-Hermes-Session-Token': gateway.token }
 }
 
 // Rejects when the signal aborts, even if the body promise never settles (a
@@ -126,11 +137,35 @@ async function attempt(url: string, init: RequestInit, timeoutMs: number): Promi
   }
 }
 
-export async function gatewayApi<T>(
-  gateway: SavedGateway,
-  request: HermesApiRequest,
-  baseUrl: string
-): Promise<T> {
+/**
+ * OAuth gateways: a 401 with a stored refresh token rotates the tokens once
+ * (oauth.ts refreshOauthTokens — concurrent 401s share one refresh) and the
+ * request is retried ONCE with the new access token. If another request
+ * already rotated them while this one was in flight, it just retries.
+ */
+export async function gatewayApi<T>(gateway: SavedGateway, request: HermesApiRequest, baseUrl: string): Promise<T> {
+  const sentWith = gateway.token
+
+  try {
+    return await send<T>(gateway, request, baseUrl)
+  } catch (error) {
+    if ((error as { statusCode?: number }).statusCode !== 401 || gateway.authMode !== 'oauth') {
+      throw error
+    }
+
+    if (gateway.token === sentWith) {
+      if (!gateway.refreshToken) {
+        throw error
+      }
+
+      await refreshOauthTokens(gateway, baseUrl)
+    }
+
+    return send<T>(gateway, request, baseUrl)
+  }
+}
+
+async function send<T>(gateway: SavedGateway, request: HermesApiRequest, baseUrl: string): Promise<T> {
   const method = String(request.method || 'GET').toUpperCase()
   const url = `${baseUrl}${pathWithProfileScope(request.path, request.profile)}`
   const headers: Record<string, string> = gatewayHeaders(gateway)

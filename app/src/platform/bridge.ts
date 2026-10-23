@@ -10,6 +10,7 @@
 // their UI hides itself. See app/README.md "Bridge" for the full list.
 
 import type {
+  DesktopAuthProvider,
   DesktopConnectionConfig,
   DesktopConnectionConfigInput,
   DesktopConnectionsRegistry,
@@ -34,6 +35,7 @@ import {
   tokenPreview
 } from './gateway-config'
 import { pickFiles, readBlobDataUrl, readBlobText, registerBlob, registerFile } from './local-files'
+import { ensureFreshOauthToken, startOauthLogin } from './oauth'
 
 type Bridge = Window['hermesDesktop']
 
@@ -79,6 +81,12 @@ function requireGateway(): SavedGateway {
   }
 
   if (!gateway.token) {
+    if (gateway.authMode === 'oauth') {
+      throw new Error(
+        `Signed out of ${hostLabel(gateway.httpUrl)} (the sign-in expired). Open Settings → Gateway and sign in again.`
+      )
+    }
+
     // Same wording as Electron's buildRemoteConnection.
     throw new Error(
       'Remote Hermes gateway is selected, but no session token is saved. Open Settings → Gateway and save a token.'
@@ -94,10 +102,32 @@ async function fetchStatus(baseUrl: string, gateway?: SavedGateway, timeoutMs = 
 
 let remoteVersion = ''
 
+async function authProviders(baseUrl: string): Promise<DesktopAuthProvider[]> {
+  try {
+    const result = await gatewayApi<{ providers?: { name?: string; display_name?: string; supports_password?: boolean }[] }>(
+      { name: '', httpUrl: baseUrl },
+      { path: '/api/auth/providers', timeoutMs: 8_000 },
+      baseUrl
+    )
+
+    return (result?.providers ?? [])
+      .filter(provider => provider?.name)
+      .map(provider => ({
+        name: String(provider.name),
+        displayName: String(provider.display_name || provider.name),
+        supportsPassword: Boolean(provider.supports_password)
+      }))
+  } catch {
+    return []
+  }
+}
+
 /** Electron ensureBackend → buildRemoteConnection + waitForHermes, v1 global remote. */
 async function connect(profile?: null | string): Promise<HermesConnection> {
   const gateway = requireGateway()
   const baseUrl = normalizeRemoteBaseUrl(gateway.httpUrl)
+  await ensureFreshOauthToken(gateway, baseUrl)
+  requireGateway()
   const status = await fetchStatus(baseUrl, gateway, 10_000)
   remoteVersion = String(status?.version || remoteVersion || '')
 
@@ -105,7 +135,7 @@ async function connect(profile?: null | string): Promise<HermesConnection> {
     baseUrl,
     mode: 'remote',
     source: 'settings',
-    authMode: 'token',
+    authMode: gateway.authMode === 'oauth' ? 'oauth' : 'token',
     remoteHost: hostLabel(baseUrl),
     remoteKind: 'url',
     remoteHermesVersion: remoteVersion || undefined,
@@ -124,11 +154,16 @@ async function connect(profile?: null | string): Promise<HermesConnection> {
   }
 }
 
-function wsUrlResult() {
+// Gated gateways take the OAuth access token as ?token= on the WebSocket too;
+// the WS leg has no 401-and-retry, so refresh one that is about to expire.
+async function wsUrlResult() {
   try {
     const gateway = requireGateway()
+    const baseUrl = normalizeRemoteBaseUrl(gateway.httpUrl)
+    await ensureFreshOauthToken(gateway, baseUrl)
+    requireGateway()
 
-    return { ok: true as const, wsUrl: buildGatewayWsUrl(normalizeRemoteBaseUrl(gateway.httpUrl), gateway.token!) }
+    return { ok: true as const, wsUrl: buildGatewayWsUrl(baseUrl, gateway.token!) }
   } catch (error) {
     return { ok: false as const, error: (error as Error).message }
   }
@@ -136,15 +171,16 @@ function wsUrlResult() {
 
 function connectionConfig(): DesktopConnectionConfig {
   const gateway = loadGateway()
+  const oauth = gateway?.authMode === 'oauth'
 
   return {
     envOverride: false,
     mode: 'remote',
     profile: null,
-    remoteAuthMode: 'token',
-    remoteOauthConnected: false,
-    remoteTokenPreview: tokenPreview(gateway?.token),
-    remoteTokenSet: Boolean(gateway?.token),
+    remoteAuthMode: oauth ? 'oauth' : 'token',
+    remoteOauthConnected: oauth && Boolean(gateway?.token),
+    remoteTokenPreview: oauth ? null : tokenPreview(gateway?.token),
+    remoteTokenSet: !oauth && Boolean(gateway?.token),
     // The token lives in the WebView's localStorage inside the app's private
     // per-UID sandbox — the Android analogue of the OS keychain gate. Not
     // Keystore-encrypted; see README "Known gaps".
@@ -165,14 +201,30 @@ function assertRemote(input: DesktopConnectionConfigInput) {
   if (input.mode !== 'remote') {
     throw new Error('Android connects to a remote Hermes gateway only — choose "Remote gateway".')
   }
+}
 
-  if (input.remoteAuthMode === 'oauth') {
-    throw new Error('OAuth-gated gateways are not supported on Android yet — use a session token.')
-  }
+/** The saved OAuth sign-in for this URL; a gated gateway has no token to type. */
+function signedInGateway(remoteUrl?: string): SavedGateway | null {
+  const existing = loadGateway()
+  const baseUrl = normalizeRemoteBaseUrl(remoteUrl ?? existing?.httpUrl ?? '')
+
+  return existing?.authMode === 'oauth' && existing.token && normalizeRemoteBaseUrl(existing.httpUrl) === baseUrl
+    ? existing
+    : null
 }
 
 function coerce(input: DesktopConnectionConfigInput): SavedGateway {
   assertRemote(input)
+
+  if (input.remoteAuthMode === 'oauth') {
+    const gateway = signedInGateway(input.remoteUrl)
+
+    if (!gateway) {
+      throw new Error(`Sign in to ${hostLabel(normalizeRemoteBaseUrl(input.remoteUrl ?? ''))} first.`)
+    }
+
+    return gateway
+  }
 
   return resolveGatewayEdit(loadGateway(), { url: input.remoteUrl, token: input.remoteToken })
 }
@@ -234,9 +286,9 @@ function registry(): DesktopConnectionsRegistry {
             kind: 'remote',
             label: gateway.name || hostLabel(gateway.httpUrl),
             url: gateway.httpUrl,
-            authMode: 'token',
+            authMode: gateway.authMode === 'oauth' ? 'oauth' : 'token',
             tokenSet: Boolean(gateway.token),
-            tokenPreview: tokenPreview(gateway.token)
+            tokenPreview: gateway.authMode === 'oauth' ? null : tokenPreview(gateway.token)
           }
         ]
       : []
@@ -256,7 +308,10 @@ async function testAndReload(gateway: SavedGateway) {
 }
 
 /** Page lifecycle seam (jsdom's location.reload can't be spied on). */
-export const pageLifecycle = { reload: () => window.location.reload() }
+export const pageLifecycle = {
+  reload: () => window.location.reload(),
+  navigate: (url: string) => window.location.assign(url)
+}
 
 function applyAndReload(gateway: SavedGateway) {
   saveGateway(gateway)
@@ -330,8 +385,8 @@ export const bridge: Bridge = {
     sharedRemote: true,
     registryScoped: true
   }),
-  getGatewayWsUrl: async () => wsUrlResult(),
-  getGatewayWsUrlFor: async () => wsUrlResult(),
+  getGatewayWsUrl: () => wsUrlResult(),
+  getGatewayWsUrlFor: () => wsUrlResult(),
   revalidateConnection: async () => {
     const gateway = bootGateway()
 
@@ -364,6 +419,15 @@ export const bridge: Bridge = {
   getConnectionConfig: async () => connectionConfig(),
   // Persists for the next boot; the running page keeps its booted gateway.
   saveConnectionConfig: async input => {
+    // The Gateway panel's "Sign in" saves the oauth-mode URL first. Nothing to
+    // persist until the sign-in returns tokens (a token-less gateway can't
+    // boot), so a not-yet-signed-in OAuth save is a no-op.
+    if (input.remoteAuthMode === 'oauth') {
+      assertRemote(input)
+
+      return connectionConfig()
+    }
+
     saveGateway(coerce(input))
 
     return connectionConfig()
@@ -390,11 +454,15 @@ export const bridge: Bridge = {
     try {
       const status = await fetchStatus(baseUrl)
 
+      const gated = Boolean(status?.auth_required)
+
       return {
         baseUrl,
         reachable: true,
-        authMode: status?.auth_required ? 'oauth' : 'token',
-        providers: [],
+        authMode: gated ? 'oauth' : 'token',
+        // Public before login; drives the panel's sign-in button copy
+        // (password variant when every provider takes a password).
+        providers: gated ? await authProviders(baseUrl) : [],
         version: status?.version || null,
         error: null
       }
@@ -402,8 +470,48 @@ export const bridge: Bridge = {
       return { baseUrl, reachable: false, authMode: 'unknown', providers: [], version: null, error: (error as Error).message }
     }
   },
-  oauthLoginConnectionConfig: () => unsupported(),
-  oauthLogoutConnectionConfig: async () => ({ ok: true, connected: false }),
+  // RFC 8252 native sign-in (oauth.ts). The whole WebView navigates to the
+  // gateway's /auth/native/authorize; the app comes back as a fresh page load
+  // that finishes the sign-in in entry.ts before booting. So this promise
+  // deliberately NEVER settles: the page unloads, and the panel keeps its
+  // "signing in" state until then instead of flashing an "incomplete" warning.
+  oauthLoginConnectionConfig: async remoteUrl => {
+    await startOauthLogin(remoteUrl, pageLifecycle.navigate)
+
+    return new Promise(() => {})
+  },
+  // Clears the sign-in locally (stored copy and the running page's). The
+  // gateway's /auth/logout revokes only cookie sessions; it is still told,
+  // best effort, but a Bearer client's refresh token stays valid server-side
+  // until it expires (README "Gated gateways").
+  oauthLogoutConnectionConfig: async remoteUrl => {
+    const baseUrl = normalizeRemoteBaseUrl(remoteUrl)
+    const stored = loadGateway()
+    const booted = bootGateway()
+
+    for (const gateway of [stored, booted]) {
+      if (gateway?.authMode === 'oauth' && gateway.token && normalizeRemoteBaseUrl(gateway.httpUrl) === baseUrl) {
+        void fetch(`${baseUrl}/auth/logout`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${gateway.token}` },
+          redirect: 'manual'
+        }).catch(() => {})
+        break
+      }
+    }
+
+    for (const gateway of [stored, booted]) {
+      if (gateway?.authMode === 'oauth' && normalizeRemoteBaseUrl(gateway.httpUrl) === baseUrl) {
+        Object.assign(gateway, { token: undefined, refreshToken: undefined, tokenExpiresAt: undefined })
+      }
+    }
+
+    if (stored?.authMode === 'oauth' && normalizeRemoteBaseUrl(stored.httpUrl) === baseUrl) {
+      saveGateway(stored)
+    }
+
+    return { ok: true, connected: false }
+  },
   getSecretStorageEncryption: async () => ({ on: false }),
   setSecretStorageEncryption: () => unsupported(),
   sshConfigHosts: async () => ({ hosts: [] }),

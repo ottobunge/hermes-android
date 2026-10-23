@@ -83,17 +83,20 @@ behavior as Electron **within the supported single token-gateway scope**,
 not Electron's lifecycle in general. "Web equivalent" depends on browser and
 WebView capabilities and has not been verified on an Android device.
 
-### Full fidelity (single token gateway)
+### Full fidelity (single gateway)
 
-- `getGatewayWsUrl` / `getGatewayWsUrlFor` — `ws(s)://…/api/ws?token=…` from the booted gateway
+- `getGatewayWsUrl` / `getGatewayWsUrlFor` — `ws(s)://…/api/ws?token=…` from the booted gateway (session token, or the sign-in's access token, refreshed first if it is about to expire)
 - `getProfileRoutes` — every profile routes to the one gateway
+- `probeConnectionConfig` — public `/api/status`; on a gated gateway (`auth_required`) also the public `/api/auth/providers` list → `authMode: 'oauth'` + providers (`supportsPassword` drives the panel's "Sign in" copy)
+- `oauthLoginConnectionConfig` — gated-gateway sign-in via the gateway's native RFC 8252 flow (PKCE S256 + state, `/auth/native/authorize` → the gateway's own login page → loopback callback intercepted by `MainActivity` → `/auth/native/token`). The page navigates away, so the promise never settles; the sign-in completes on the next page load (round 16)
+- `oauthLogoutConnectionConfig` — clears the sign-in locally (stored and running) and tells the gateway `/auth/logout` best-effort with Bearer; see "Gated gateways" for the revocation limit
 
 ### Web equivalent
 
 - `getConnection` / `getConnectionFor` — `/api/status` probe → `HermesConnection` (mode `remote`, token, wsUrl)
 - `revalidateConnection` — re-probes `/api/status`
-- `api` — fetch with session-token auth, whole-exchange timeout, multipart upload
-- `getConnectionConfig` / `saveConnectionConfig` / `applyConnectionConfig` / `testConnectionConfig` / `probeConnectionConfig` — drive the reused Gateway settings panel (remote + token only; save persists for the next boot; apply = test → save → reload; test without a usable token fails)
+- `api` — fetch with session-token auth (or Bearer + one refresh-and-retry on a gated gateway), whole-exchange timeout, multipart upload
+- `getConnectionConfig` / `saveConnectionConfig` / `applyConnectionConfig` / `testConnectionConfig` — drive the reused Gateway settings panel (remote only; token mode or a gated gateway's sign-in; save persists for the next boot — an OAuth save before signing in is a no-op; apply = test → save → reload; test without a usable token or sign-in fails)
 - `connections.list` / `.save` / `.test` — a one-entry registry; `.save` changes to endpoint or token go through test → save → reload, label-only edits save in place
 - `profile.get` / `.set` / `.remember` / `.getDefault` / `.setDefault` — localStorage (no backend relaunch)
 - `getVersion` — real app version, `platform: 'android'`
@@ -113,7 +116,6 @@ WebView capabilities and has not been verified on an Android device.
 - Flags: `glassSupported`, `translucencySupported`, `localModelsEnabled`, `guestOnboardingEnabled` = `false`; `skipIntro` = `true`
 - `touchBackend` → `{ ok: true }` (no local backend to keep warm)
 - `getPoolLimits` / `setPoolLimits` → upstream defaults, not persisted
-- `oauthLoginConnectionConfig` rejects; `oauthLogoutConnectionConfig` → not connected
 - `getSecretStorageEncryption` → off; `setSecretStorageEncryption` rejects
 - `sshConfigHosts` / `sshResolveHost` → empty
 - `connections.remove` rejects (exactly one gateway); `connections.setPrimary` → success-shaped no-op
@@ -153,8 +155,24 @@ state.
 - **No local backend.** Remote gateway only. The reused Gateway panel still
   shows the desktop's Local / Hermes Cloud / SSH mode cards; choosing any of
   them errors ("Android connects to a remote Hermes gateway only").
-- **Token auth only.** OAuth-gated gateways are rejected; Hermes Cloud sign-in
-  is unavailable.
+- **Gated gateways (round 16).** A `hermes serve` with dashboard auth
+  (`dashboard.basic_auth` or OAuth providers) is signed into with the
+  gateway's native RFC 8252 flow. REST then carries `Authorization: Bearer`,
+  the WebSocket `?token=<access>`, and a 401 rotates the tokens once via
+  `/auth/native/refresh`. Limits:
+  - **Logout can't revoke server-side.** `/auth/logout` only revokes cookie
+    sessions. Signing out clears the tokens on the device, but the refresh
+    token stays valid on the gateway until it expires (30 days for basic
+    auth).
+  - **Some upstream IdPs refuse embedded WebViews** (Google notably). The
+    sign-in runs inside the app's WebView, so such a provider's own login
+    page may block it. Password providers and IdPs that allow WebViews work.
+  - **The loopback callback is completed by the Android shell**
+    (`MainActivity`). In a desktop browser (`npm run dev` / `preview`) the
+    final `http://127.0.0.1/?code=…` has nothing to catch it, so the sign-in
+    doesn't complete there. `scripts/gated-signin-e2e.mjs` stands in for the
+    shell with a request route.
+  - Hermes Cloud sign-in is still unavailable.
 - **One gateway.** No multi-connection registry. Changing the gateway reloads
   the page instead of Electron's in-place re-dial, and the running page stays
   on the gateway it booted with until then.
@@ -164,13 +182,14 @@ state.
 - **No terminal, git, file browser, local file previews, pop-out windows, pet
   overlay, quick entry, find-in-page, in-app updates.**
 - **HTTPS/WSS gateways are the supported path.** Plain `http://` sends the
-  session token and traffic unencrypted, so use it only on a network you trust
-  (LAN/tailnet). The onboarding copy says so. On a native Android build it
+  session token, a gated gateway's password and access/refresh tokens, and all
+  traffic unencrypted, so use it only on a network you trust (LAN/tailnet). The onboarding copy says so. On a native Android build it
   will also need an explicit cleartext policy (`server.cleartext` or a
   `networkSecurityConfig`). `allowMixedContent` does **not** provide that, so
-  it was removed from `capacitor.config.ts`. **That native policy decision is
-  deferred until `android/` is generated**; until then, plain HTTP is only
-  verified in the desktop-browser smoke.
+  it was removed from `capacitor.config.ts`. *(Since `android/` was
+  generated, `capacitor.config.ts` sets a **debug test-rig** policy:
+  `server.cleartext: true` + `androidScheme: 'http'`, commit `9a7843e`, which
+  says a release build must not ship it. The release policy is still open.)*
 - **Web previews are unavailable.** The desktop's Browser/URL preview pane
   hosts pages in Electron's `<webview>` guest tag, which Android's WebView
   doesn't have. `src/platform/webview-unavailable.ts` makes that tag fail
@@ -257,6 +276,185 @@ Run `npm run build` before every smoke: a stale `dist/` serves a blank page
 (round 9).
 
 ## Verification
+
+### Round 16 (2026-10-23): gated-gateway sign-in (basic_auth / OAuth)
+
+A gateway with dashboard auth runs **gated** (`auth_required`). It ignores
+the static session token, so before this round every authed call 401'd and the
+WS upgrade 403'd, and "Sign in" failed with "Not available on Android".
+
+**Protocol, checked against the installed gateway source**
+(`hermes_cli/dashboard_auth/routes.py`):
+- `/auth/native/authorize` requires S256 and a canonical **loopback**
+  `redirect_uri` (IP literal; `localhost` is rejected). We use
+  `http://127.0.0.1/`.
+- `/auth/native/token` and `/auth/native/refresh` return the tokens in JSON,
+  with no cookies. Refresh rejection is `401 {"error":"session_expired"}`.
+- `/auth/logout` revokes **only cookie sessions**, so a Bearer client can't
+  revoke its refresh token (see Deviations).
+- `/auth/password-login` (cookies only) is not used.
+
+**Web side** (`src/platform/`):
+- `oauth.ts` (new): PKCE with WebCrypto (32-byte verifier, `b64url(SHA-256)`
+  challenge), random state, and the pending sign-in in
+  `hermes.android.oauth-pending`.
+  - `startOauthLogin` navigates the whole page to the authorize URL.
+  - `completeOauthRedirect`, run by `entry.ts` **before** choosing onboarding
+    or the app, redeems `?oauth-code=&oauth-state=` with the verifier. It
+    stores `{authMode:'oauth', token, refreshToken, tokenExpiresAt}` and
+    cleans the URL. A state mismatch, missing pending, bogus code or expired
+    pending (30 min) stores **nothing** and leaves a one-shot notice
+    (inline on onboarding, a notification in the app). A pending sign-in
+    with no code is a **cancellation** (Back out of the login page).
+  - `refreshOauthTokens` is single-flight per refresh token and rotates the
+    tokens **in place**, so the booted gateway object picks them up. It only
+    writes the stored copy if that copy holds the same credential.
+    `session_expired` clears the tokens.
+- `gateway-config.ts`: `SavedGateway` gains optional `authMode`,
+  `refreshToken` and `tokenExpiresAt`. If they're absent the gateway is in
+  token mode, so existing saved gateways are unchanged. A same-endpoint edit
+  with no new token keeps the sign-in; a typed token means token mode.
+- `api-transport.ts`: an OAuth gateway sends **only** `Authorization: Bearer`,
+  any other gateway **only** `X-Hermes-Session-Token`. A 401 on an OAuth
+  gateway refreshes once (shared by concurrent callers) and retries once; if
+  another request already rotated the token, it just retries.
+- `bridge.ts`:
+  - probe lists providers;
+  - `connectionConfig` reports `remoteOauthConnected`;
+  - an OAuth save before sign-in is a no-op: the panel saves first, and a
+    token-less gateway can't boot;
+  - apply/test use the signed-in gateway;
+  - `getConnection` / `getGatewayWsUrl*` refresh an access token within 60 s
+    of expiry (the WS leg has no 401 retry);
+  - login never settles (the page unloads; documented in `bridge.ts`);
+  - logout clears locally and notifies the gateway best-effort.
+- `onboarding.tsx`: the notice, plus copy that mentions sign-in and that
+  `http://` sends credentials unencrypted.
+
+**Native side** (`android/app/src/main/java/com/bunge/hermes/MainActivity.java`).
+Capacitor's `launchIntent` sends every non-app host to the **system
+browser**, which would leave the app mid-sign-in. `GatewaySignInClient`
+(a `BridgeWebViewClient` subclass) handles this:
+- From a main-frame navigation to `…/auth/native/authorize` until the app
+  origin loads again, it keeps main-frame http(s) navigation in the WebView:
+  the gateway's `/login`, a provider chooser or an IdP.
+- It rewrites the loopback callback `http://127.0.0.1[:port]/?code=…&state=…`
+  to `{app}/?oauth-code=…&oauth-state=…`.
+- Everything else goes to Capacitor's default.
+- Capacitor injects its native bridge only into the app origin
+  (`addDocumentStartJavaScript` with the allowed origins), so the gateway's
+  pages never see it.
+- Compiles: `nix develop --command ./gradlew :app:compileDebugJavaWithJavac`
+  → exit 0. No APK was installed or run on a device or emulator this round.
+
+**Tests** (`src/platform/oauth.test.ts`, 18):
+- transport header selection (Bearer vs session token, never both);
+- concurrent 401s → **one** refresh, each request retried once;
+- a second 401 after the refresh → returned, no second refresh;
+- `session_expired` → tokens cleared in memory and storage;
+- token mode never refreshes;
+- PKCE challenge = Node `sha256(verifier).base64url`, plus the authorize
+  parameters;
+- redemption with the verifier → oauth gateway saved, URL cleaned;
+- bogus code (400) → nothing stored, failure notice;
+- state mismatch → the gateway is never contacted, nothing stored;
+- a callback with no pending sign-in → nothing stored;
+- pending with no code → cancelled;
+- bridge-level: probe with providers, oauth-connected config, the no-op
+  save, login never settles, logout clears and posts Bearer, connected
+  descriptor/WS with the access token.
+
+**Mutation checks:** sending both headers, removing the single-flight map,
+dropping the state comparison, or not clearing on `session_expired` each
+fails exactly one test.
+
+**Live end to end against a real gated gateway**
+(`scripts/gated-signin-e2e.mjs`, optional per the brief).
+- A second scratch gateway, `/tmp/hermes-gated-home` on 127.0.0.1:19729, with
+  `HERMES_DASHBOARD_BASIC_AUTH_*`. The gate engages only for a non-loopback
+  public URL, so `HERMES_DASHBOARD_PUBLIC_URL=http://gated.test:19729` is set
+  while still **binding 127.0.0.1**; nothing is exposed on the network.
+  Result: `auth_required: true`, providers listed, `/api/sessions` → 401
+  without auth.
+- Headless Chromium drives onboarding → URL → the probe's "Sign in" (the
+  password copy) → the gateway's real `/login` form → loopback redirect.
+  A request route stands in for `MainActivity` → the app redeems the code
+  and boots connected.
+- Asserts:
+  - every authed `/api/` call carries Bearer only (the public
+    `/api/auth/providers` and `/api/status` excluded);
+  - an open, receiving WS with `?token=`;
+  - the saved oauth gateway;
+  - a cleaned URL;
+  - zero page errors.
+- Each boot opens two gateway sockets: one closes after ~0.3–0.5 s, one stays
+  open. Both received frames, so neither was rejected. The first version of
+  the check took the first socket and flaked once; it now requires an open,
+  receiving socket.
+- Final run, verbatim (token redacted by the script):
+
+```
+probe → gated, password provider: "Sign in" button shown
+gateway login page: /login
+  ws open, 17 frames received
+  ws closed after 346ms, 3 frames received
+loopback callback intercepted: yes; app URL cleaned: true
+saved gateway: authMode=oauth token=set refreshToken=set expiresAt=1792802089
+REST auth seen: bearer
+WebSocket: ws://127.0.0.1:19729/api/ws?token=<redacted> open, receiving
+GATED E2E OK: native sign-in → connected with Bearer REST and token WebSocket
+exit=0
+```
+
+**Regression caught by the token smoke.** The first, longer onboarding copy
+pushed "Save and reconnect" below the first screen at 390×844 (save at
+851–854 > 844). That failed 3/3 smokes; the copy was tightened and they pass.
+
+**Gates** (final code, in order, all exit 0):
+
+```
+npm run typecheck                                        → exit 0
+npm run build                                            → exit 0
+npx vitest run src/platform src/app/open-session.test.ts → exit 0
+  Test Files  5 passed (5)
+  Tests  78 passed (78)
+node --test scripts/smoke-classifier.test.mjs            → exit 0
+  # tests 8
+  # pass 8
+  # fail 0
+node scripts/smoke.mjs … (token-mode rig)                → exit 0, 3 consecutive runs
+node scripts/gated-signin-e2e.mjs … (gated gateway)      → exit 0
+```
+
+Final token-mode smoke run, verbatim (token redacted):
+
+```
+screenshot: /tmp/smoke-out/1-onboarding.png
+[tablet] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+[tablet] first-run overlay: provider picker after 2.5s (gateway has no model provider) → skipped
+[tablet] thread list: switched Smoke alpha → Smoke beta → Smoke alpha, transcripts followed
+screenshot: /tmp/smoke-out/2-connected-1280.png
+screenshot: /tmp/smoke-out/3-connected-tablet-820.png
+[phone] first-run overlay: none (provider configured or previously skipped)
+screenshot: /tmp/smoke-out/4-connected-phone-390.png
+[phone] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+[phone] thread list: switched Smoke alpha → Smoke beta → Smoke alpha, transcripts followed
+screenshot: /tmp/smoke-out/5-phone-drawer-open.png
+screenshot: /tmp/smoke-out/6-phone-settings.png
+screenshot: /tmp/smoke-out/7-phone-capabilities.png
+screenshot: /tmp/smoke-out/8-phone-onboarding.png
+[phone] first-run overlay: none (provider configured or previously skipped)
+[phone] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+screenshot: /tmp/smoke-out/9-phone-drawer-project.png
+[phone] drawer browsing: project drill-in and "All projects" kept the drawer open
+[phone] first-run overlay: none (provider configured or previously skipped)
+[phone] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+screenshot: /tmp/smoke-out/10-phone-drawer-two-open-sessions.png
+[phone] focus switch: Smoke beta → already-open Smoke alpha (no route change) dismissed the drawer
+page errors: 0 (none tolerated)
+SMOKE OK: onboarding → connected chat surface (tablet + phone), thread-list switching works, zero page errors, zero bridge errors
+exit=0
+```
 
 ### Round 15 (2026-10-23): card kebab/timestamp taps dismiss the drawer again
 
