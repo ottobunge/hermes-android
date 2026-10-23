@@ -258,6 +258,116 @@ Run `npm run build` before every smoke: a stale `dist/` serves a blank page
 
 ## Verification
 
+### Round 14 (2026-10-23): a reorder-handle tap no longer dismisses the drawer
+
+**What regressed (round 13, b19d919).**
+- Round 13 classified **any** press inside a session row's RowButton as a
+  selection.
+- The reorder grab handle lives **inside** that RowButton:
+  - compact rows put `SidebarRowGrab` directly in the body
+    (`session-row.tsx:473-483`);
+  - card rows put it inside the body's header line (`:553-554`).
+- The handle deliberately stops its click (`chrome.tsx:348-349`,
+  `data-reorder-handle`), so the row's resume handler never runs.
+- The drawer's capture listener had already recorded "selects", so a
+  sub-threshold tap on an unfocused row's handle closed the drawer
+  **without** selecting anything. The reviewer's real-component probe: 0
+  resumes, 2 close events (round 12: 0).
+
+**Fix** (`src/platform/phone-layout.ts:90`, `:115-116`).
+- At pointerdown, a press inside `[data-reorder-handle], [data-row-actions]`
+  is **not** a press on the row itself. That is the exact predicate
+  `session-row.tsx:396` already uses to keep its drag gesture off those
+  controls, which are the only nested non-resume controls. The `grep
+  stopPropagation` over `sidebar/chrome.tsx` and `session-row.tsx` finds:
+  - the handle (`chrome.tsx:349`);
+  - the header "+" buttons (`:81`), which aren't in session rows;
+  - the row's own modifier-click branch (`session-row.tsx:458`).
+- Such a press is not classified as a selection, and its row isn't kept for
+  the selected-row fallback. It dismisses only if it actually navigated.
+- That also keeps the drawer open for a tap on the **focused** row's
+  handle, which round 12's selected-row fallback would have closed.
+- Everything else in the row body keeps the round-13 pointerdown
+  classification, so the Unread-filter unmount case still dismisses.
+- Cron rows are untouched: their `Tip` sets the body's `data-slot` to
+  `tooltip-trigger`, so they never matched. The round-13 comment and README
+  text calling them selections are corrected.
+
+**Coverage** (`src/platform/phone-layout.test.ts`, 12 tests). New, for both
+the **compact** and **card** layouts, with the handle's real
+`stopPropagation` and a resume counter on the row:
+- tap an unfocused row's reorder handle → 0 resumes, drawer stays;
+- tap the focused row's handle → drawer stays;
+- tap the row body → 1 resume, drawer dismisses.
+
+The card fixture is built with DOM calls, as React does: the HTML parser
+would split the ⋯ `<button>` nested inside the RowButton.
+
+**Negative control:** `phone-layout.ts` restored to round 13 (`git show
+b19d919:…`). Exactly the four handle tests fail; the unmount, focus-switch,
+browsing and body tests pass:
+
+```
+✓ dismisses when selecting a session UNMOUNTS its row (Unread filter), focus-only, no URL change
+✓ dismisses on a focus-only switch to an already-open session (row becomes selected)
+✓ dismisses when re-selecting the focused session and on nav items
+✓ keeps the drawer for browsing controls, even when they replace themselves
+✓ keeps the drawer for ⇧-clicks (pin/archive) and the row actions kebab
+× keeps the drawer when tapping an unfocused compact row's reorder handle (no resume)
+× keeps the drawer when tapping the FOCUSED compact row's reorder handle
+✓ dismisses when tapping the compact row body (resume)
+× keeps the drawer when tapping an unfocused card row's reorder handle (no resume)
+× keeps the drawer when tapping the FOCUSED card row's reorder handle
+✓ dismisses when tapping the card row body (resume)
+✓ closes on a tap outside, and does nothing at tablet width
+```
+
+**Gates** (final code, in order, all exit 0):
+
+```
+npm run typecheck                                        → exit 0
+npm run build                                            → exit 0
+npx vitest run src/platform src/app/open-session.test.ts → exit 0
+  Test Files  4 passed (4)
+  Tests  56 passed (56)
+node --test scripts/smoke-classifier.test.mjs            → exit 0
+  # tests 8
+  # pass 8
+  # fail 0
+node scripts/smoke.mjs …                                 → exit 0, 3 consecutive runs
+```
+
+The live smoke has no reorder-handle step; this case is covered only by the
+jsdom tests above. Final smoke run, verbatim (token redacted):
+
+```
+screenshot: /tmp/smoke-out/1-onboarding.png
+[tablet] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+[tablet] first-run overlay: provider picker after 1.8s (gateway has no model provider) → skipped
+[tablet] thread list: switched Smoke alpha → Smoke beta → Smoke alpha, transcripts followed
+screenshot: /tmp/smoke-out/2-connected-1280.png
+screenshot: /tmp/smoke-out/3-connected-tablet-820.png
+[phone] first-run overlay: none (provider configured or previously skipped)
+screenshot: /tmp/smoke-out/4-connected-phone-390.png
+[phone] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+[phone] thread list: switched Smoke alpha → Smoke beta → Smoke alpha, transcripts followed
+screenshot: /tmp/smoke-out/5-phone-drawer-open.png
+screenshot: /tmp/smoke-out/6-phone-settings.png
+screenshot: /tmp/smoke-out/7-phone-capabilities.png
+screenshot: /tmp/smoke-out/8-phone-onboarding.png
+[phone] first-run overlay: none (provider configured or previously skipped)
+[phone] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+screenshot: /tmp/smoke-out/9-phone-drawer-project.png
+[phone] drawer browsing: project drill-in and "All projects" kept the drawer open
+[phone] first-run overlay: none (provider configured or previously skipped)
+[phone] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+screenshot: /tmp/smoke-out/10-phone-drawer-two-open-sessions.png
+[phone] focus switch: Smoke beta → already-open Smoke alpha (no route change) dismissed the drawer
+page errors: 0 (none tolerated)
+SMOKE OK: onboarding → connected chat surface (tablet + phone), thread-list switching works, zero page errors, zero bridge errors
+exit=0
+```
+
 ### Round 13 (2026-10-23): drawer dismissal survives a filtered-row unmount
 
 **What was still wrong (round 12, 349ff6f).** Round 12 decided "was that a
@@ -283,8 +393,11 @@ end up as the selected row? Selecting a session can destroy that node.
   (`[data-slot="context-menu-trigger"]`, `:81`, `:110`).
 - Verified against the components: `session-row.tsx` renders
   `SessionContextMenu` → `ActionsContextMenu` → `ContextMenuTrigger asChild`
-  → `SidebarRowShell` → `SidebarRowBody` (the RowButton). Cron rows
-  (`cron-jobs-section.tsx:316-385`) have the same shape.
+  → `SidebarRowShell` → `SidebarRowBody` (the RowButton). *(Round 14
+  correction: this also claimed cron rows have the same shape. In source they
+  do, but their `Tip` overrides the body's `data-slot` to `tooltip-trigger`,
+  so they never match the RowButton test; the reviewer confirmed this on the
+  rendered component.)*
 - **Browsing controls never have that shape:**
   - "Show more" (`projects/workspace-header.tsx:85`) and Back / "All
     projects" (`projects/overview-row.tsx:66`) are RowButtons in **bare**

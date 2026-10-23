@@ -128,6 +128,93 @@ describe('phone drawer dismissal', () => {
     expect(closes).toBe(0)
   })
 
+  // session-row.tsx nests SidebarRowGrab (chrome.tsx: data-reorder-handle,
+  // onClick stopPropagation) INSIDE the RowButton — directly in compact mode,
+  // inside the card's header line in card mode. A sub-threshold tap on it
+  // never reaches the row's resume handler, so nothing is selected.
+  const GRAB = '<span data-reorder-handle="" aria-label="Reorder"><span>•</span></span>'
+  const COMPACT_ROW = (shellClass = '') =>
+    `<div data-slot="context-menu-trigger" class="grid ${shellClass}"><button data-slot="row-button" type="button">` +
+    `${GRAB}<span data-label="">Smoke alpha</span></button><div data-row-actions=""><button aria-label="Session actions">⋯</button></div></div>`
+  // Card mode nests the ⋯ <button> inside the RowButton. React builds that
+  // with DOM calls; the HTML parser would split nested buttons, so build it
+  // the same way here.
+  const CARD_ROW = (shellClass = '') => {
+    const shell = Object.assign(document.createElement('div'), { className: `grid ${shellClass}` })
+    shell.dataset.slot = 'context-menu-trigger'
+    const body = Object.assign(document.createElement('button'), { type: 'button' })
+    body.dataset.slot = 'row-button'
+    const header = document.createElement('div')
+    header.innerHTML = `${GRAB}<span>ctx</span>`
+    const actions = document.createElement('div')
+    actions.dataset.rowActions = ''
+    const kebab = Object.assign(document.createElement('button'), { textContent: '⋯' })
+    kebab.setAttribute('aria-label', 'Session actions')
+    actions.append(kebab)
+    header.append(actions)
+    const label = Object.assign(document.createElement('span'), { textContent: 'Smoke alpha' })
+    label.dataset.label = ''
+    body.append(header, label)
+    shell.append(body)
+
+    return shell
+  }
+
+  function wireRow(overlay: Element) {
+    const row = overlay.querySelector('[data-slot="row-button"]')!
+    const handle = overlay.querySelector('[data-reorder-handle]')!
+    let resumed = 0
+    handle.addEventListener('click', event => event.stopPropagation())
+    row.addEventListener('click', () => {
+      resumed++
+      row.parentElement!.className = 'grid bg-(--ui-row-active-background)'
+    })
+
+    return { handle, label: row.querySelector('[data-label]')!, resumed: () => resumed }
+  }
+
+  const rowIn = (layout: 'card' | 'compact', shellClass: string) => {
+    if (layout === 'compact') {
+      return drawer(COMPACT_ROW(shellClass))
+    }
+
+    const overlay = drawer('')
+    overlay.append(CARD_ROW(shellClass))
+
+    return overlay
+  }
+
+  for (const layout of ['compact', 'card'] as const) {
+    it(`keeps the drawer when tapping an unfocused ${layout} row's reorder handle (no resume)`, async () => {
+      const { handle, resumed } = wireRow(rowIn(layout, 'bg-(--ui-row-open-background)'))
+
+      press(handle)
+      await settle()
+
+      expect(resumed()).toBe(0)
+      expect(closes).toBe(0)
+    })
+
+    it(`keeps the drawer when tapping the FOCUSED ${layout} row's reorder handle`, async () => {
+      const { handle } = wireRow(rowIn(layout, 'bg-(--ui-row-active-background)'))
+
+      press(handle)
+      await settle()
+
+      expect(closes).toBe(0)
+    })
+
+    it(`dismisses when tapping the ${layout} row body (resume)`, async () => {
+      const { label, resumed } = wireRow(rowIn(layout, 'bg-(--ui-row-open-background)'))
+
+      press(label)
+      await settle()
+
+      expect(resumed()).toBe(1)
+      expect(closes).toBeGreaterThan(0)
+    })
+  }
+
   it('closes on a tap outside, and does nothing at tablet width', async () => {
     drawer(SESSION_ROW('Smoke alpha'))
     press(document.getElementById('outside')!)

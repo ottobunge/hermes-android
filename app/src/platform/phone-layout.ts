@@ -11,8 +11,7 @@
 //      than clip;
 //   3. the statusbar scrolls sideways instead of clipping;
 //   4. the drawer closes on a tap outside it, or when a tap inside SELECTS:
-//      a session (or cron job) row's main target, a nav item, or anything that
-//      navigates. Which kind of tap it is gets decided at pointerdown, from
+//      a session row's main target, a nav item, or anything that navigates. Which kind of tap it is gets decided at pointerdown, from
 //      the row's structure — selecting can re-select the current session,
 //      only switch focus (no URL change), or even unmount the row (an Unread
 //      filter drops it once it is read). Browsing controls inside the drawer
@@ -65,11 +64,20 @@ function closeDrawer(overlay: Element) {
 //     SidebarRowBody) whose DIRECT parent is a row shell wrapped in that row's
 //     context menu. session-row.tsx renders SessionContextMenu →
 //     ActionsContextMenu → ContextMenuTrigger asChild → SidebarRowShell →
-//     SidebarRowBody, so the shell carries data-slot="context-menu-trigger";
-//     cron rows (cron-jobs-section.tsx) are built the same way. A plain click
-//     on it resumes the session (openSession), whatever that does to the DOM:
-//     route, focus an open tile/tab without routing, or — with the Unread
-//     filter — mark it read and so unmount the row.
+//     SidebarRowBody, so the shell carries data-slot="context-menu-trigger".
+//     A plain click on it resumes the session (openSession), whatever that
+//     does to the DOM: route, focus an open tile/tab without routing, or —
+//     with the Unread filter — mark it read and so unmount the row.
+//     (Cron rows look similar in source, but their Tip overrides the body's
+//     data-slot to "tooltip-trigger", so they never match the RowButton test;
+//     their tap only expands the row.)
+//   - EXCEPT controls nested inside that RowButton that don't resume: the
+//     reorder grab handle (chrome.tsx SidebarRowGrab, data-reorder-handle,
+//     stops its click from reaching the row) and the row-actions slot
+//     (data-row-actions; inside the body in card mode). This is the same
+//     "not a press on the row itself" predicate session-row.tsx uses for its
+//     drag gesture. A press there dismisses only if it navigated (never via
+//     the selected-row check: the handle of the focused row is "selected").
 // Browsing RowButtons never have that shape: "Show more" (workspace-header.tsx)
 // and Back (overview-row.tsx) sit in bare shells with no context menu; project
 // drill-in (overview-row.tsx), lane headers (workspace-group.tsx) and gateway
@@ -79,6 +87,7 @@ function closeDrawer(overlay: Element) {
 // are not selections and keep the drawer.
 const NAV_ITEM = '[data-sidebar="menu-button"]'
 const ENTITY_ROW_SHELL = '[data-slot="context-menu-trigger"]'
+const ROW_NESTED_CONTROL = '[data-reorder-handle], [data-row-actions]'
 const SELECTED_ROW = '.bg-\\(--ui-row-active-background\\)'
 // Other rows: a selection may still show up as the row turning selected a
 // few frames after the click (focus commits through the session stores).
@@ -103,7 +112,8 @@ function onPointerDown(event: PointerEvent) {
 
   if (overlay.contains(target)) {
     // A tap that selects hands the screen back (decided after the click).
-    const rowButton = target.closest('[data-slot="row-button"]')
+    const nested = Boolean(target.closest(ROW_NESTED_CONTROL))
+    const rowButton = nested ? null : target.closest('[data-slot="row-button"]')
 
     press = {
       href: location.href,
