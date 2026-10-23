@@ -9,8 +9,9 @@
 //   1. its message is exactly the guard's message;
 //   2. its TOP stack frame is the guard's own `Error(...)` construction site —
 //      the file:line:col found in THIS build by findGuardSite(). No site found
-//      (zero or several candidates, or a different build served) means no
-//      allowance at all: fail closed;
+//      (zero or several candidates) means no allowance at all: fail closed.
+//      A served guard frame whose filename or coordinates differ from the
+//      scanned site is rejected;
 //   3. it happens in a connected-surface phase (onboarding gets no allowance —
 //      the thread list isn't mounted there);
 //   4. the phase's count stays within KNOWN_LOOP_LIMIT_PER_PHASE.

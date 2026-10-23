@@ -34,7 +34,8 @@ if (!args.gateway || !args.token) {
 fs.mkdirSync(args.out, { recursive: true })
 
 // Where THIS build's tap render-loop guard throws (fail closed: null → no
-// allowance). If --app serves a different build, its frames won't match.
+// allowance). A served guard frame whose filename or coordinates differ from
+// the scanned site is rejected.
 const assetsDir = path.join(args.dist, 'assets')
 const guardSite = findGuardSite(
   (fs.existsSync(assetsDir) ? fs.readdirSync(assetsDir) : [])

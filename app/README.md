@@ -314,8 +314,9 @@ V8 reports for that frame. Node confirms V8 reports `Error(` at `Error` and
   exactly the top frame of every observed baseline error.
 - No source maps are emitted, so the site comes from the minified asset, not
   from a source-mapped origin.
-- Zero or several candidates, or a different build being served, means **no
-  allowance**: every page error fails (fail closed).
+- Zero or several candidates means **no allowance**: every page error fails
+  (fail closed). A served guard frame whose filename or coordinates differ
+  from the scanned site is rejected.
 
 Page errors are judged by `scripts/smoke-classifier.mjs`. An error is
 tolerated only if **all** of these hold, and anything else fails the run:
