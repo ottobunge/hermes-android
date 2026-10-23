@@ -13,7 +13,7 @@ import { parseArgs } from 'node:util'
 
 import { chromium } from 'playwright-core'
 
-import { classifyPageErrors, KNOWN_LOOP_LIMIT_PER_PHASE } from './smoke-classifier.mjs'
+import { classifyPageErrors, findGuardSite, KNOWN_LOOP_LIMIT_PER_PHASE } from './smoke-classifier.mjs'
 
 const { values: args } = parseArgs({
   options: {
@@ -21,7 +21,9 @@ const { values: args } = parseArgs({
     gateway: { type: 'string' },
     token: { type: 'string' },
     chromium: { type: 'string', default: process.env.CHROMIUM_PATH },
-    out: { type: 'string', default: 'smoke-out' }
+    out: { type: 'string', default: 'smoke-out' },
+    // The build being served (for locating the render-loop guard site).
+    dist: { type: 'string', default: 'dist' }
   }
 })
 
@@ -30,6 +32,20 @@ if (!args.gateway || !args.token) {
 }
 
 fs.mkdirSync(args.out, { recursive: true })
+
+// Where THIS build's tap render-loop guard throws (fail closed: null → no
+// allowance). If --app serves a different build, its frames won't match.
+const assetsDir = path.join(args.dist, 'assets')
+const guardSite = findGuardSite(
+  (fs.existsSync(assetsDir) ? fs.readdirSync(assetsDir) : [])
+    .filter(name => name.endsWith('.js'))
+    .map(name => ({ name, source: fs.readFileSync(path.join(assetsDir, name), 'utf8') }))
+)
+console.log(
+  guardSite
+    ? `render-loop guard site: ${guardSite.file}:${guardSite.line}:${guardSite.column}`
+    : 'render-loop guard site: NOT identified in this build — no page error will be tolerated'
+)
 
 const problems = []
 const pageErrors = []
@@ -160,13 +176,13 @@ if (overflow > 0) {
 
 await browser.close()
 
-const verdict = classifyPageErrors(pageErrors)
+const verdict = classifyPageErrors(pageErrors, guardSite)
 problems.push(...verdict.problems)
 
 for (const [label, count] of Object.entries(verdict.tolerated)) {
   console.log(
     `[${label}] baseline-shaped render-loop pageerror ×${count} (tolerated, bound ${KNOWN_LOOP_LIMIT_PER_PHASE}): ` +
-      'tap getSnapshot guard message, top frame in the capabilities-* chunk'
+      'guard message, top frame exactly at the guard site'
   )
 }
 

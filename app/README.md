@@ -186,8 +186,9 @@ state.
   fresh object whose fields are all `===` the previous ones, so tap's
   50-commit guard throws. The app still renders and works afterwards. See
   "Upstream comparison" below for the Electron reproduction. The smoke
-  tolerates only errors with this loop's shape (message, top frame,
-  connected phase, bounded count), and fails on anything else. See "Smoke"
+  tolerates only errors thrown by tap's guard itself (exact message, top
+  frame exactly at the guard's `file:line:column` in this build, connected
+  phase, bounded count), and fails on anything else. See "Smoke"
   for what that does and doesn't establish.
 - **`app/android/` does not exist.** `npx cap add android` / `npx cap sync
   android` were not run, so the native project is not committed yet.
@@ -241,7 +242,7 @@ hermes gateway run &                       # initializes state.db (else /api/ses
 
 ## Verification
 
-Round 6 (2026-10-23, review-panel R2 fixes). Gates run in this order, all exit 0:
+Round 7 (2026-10-23, review-panel R3 fix). Gates run in this order, all exit 0:
 
 ```
 npm run typecheck                               → exit 0
@@ -250,26 +251,21 @@ npx vitest run src/platform                     → exit 0
   Test Files  1 passed (1)
   Tests  18 passed (18)
 node --test scripts/smoke-classifier.test.mjs   → exit 0
-  # Subtest: baseline-shaped errors within the bound are tolerated
-  ok 1 - baseline-shaped errors within the bound are tolerated
-  # Subtest: the same message from an unrelated stack fails
-  ok 2 - the same message from an unrelated stack fails
-  # Subtest: a capabilities frame below an unrelated top frame still fails
-  ok 3 - a capabilities frame below an unrelated top frame still fails
-  # Subtest: more than the bound fails
-  ok 4 - more than the bound fails
-  # Subtest: onboarding gets no allowance
-  ok 5 - onboarding gets no allowance
-  # Subtest: any other message fails
-  ok 6 - any other message fails
-  # tests 6
-  # suites 0
-  # pass 6
+  ok 1 - findGuardSite locates the single guard Error( in the built assets
+  ok 2 - findGuardSite reports `new Error(` at `new`
+  ok 3 - findGuardSite fails closed on zero or several candidates
+  ok 4 - baseline-shaped errors at the guard site within the bound are tolerated
+  ok 5 - same message, same capabilities chunk, different function/location fails
+  ok 6 - the same message from an unrelated stack fails
+  ok 7 - a guard frame below an unrelated top frame still fails
+  ok 8 - no identified guard site means no allowance
+  ok 9 - more than the bound fails
+  ok 10 - onboarding gets no allowance
+  ok 11 - any other message fails
+  # tests 11
+  # pass 11
   # fail 0
-  # cancelled 0
-  # skipped 0
-  # todo 0
-  # duration_ms 125.435825
+node scripts/smoke.mjs …                        → exit 0 (output below)
 ```
 
 - **`bridge.test.ts` (18 tests).** Beyond URL/transport mapping it covers:
@@ -286,16 +282,16 @@ node --test scripts/smoke-classifier.test.mjs   → exit 0
   - apply without a token refused;
   - a body stall after headers.
 
-  **Mutation check:** removing the WS probe fails 3 tests, removing the
-  reload fails 1, and pointing Test back at the booted gateway fails 1.
-- `npm run build` still emits `Collapse-Bold-*.woff2`; the smoke checks that
-  it loads.
+  **Mutation check (round 6):** removing the WS probe fails 3 tests, removing
+  the reload fails 1, and pointing Test back at the booted gateway fails 1.
+- `npm run build` emits `Collapse-Bold-*.woff2`; the smoke checks that it
+  loads.
 - `npx vitest run` (full suite) — not rerun since round 2. Round 2 result:
   **FAILING**, 27 of 1012 files and 64 of 8403 tests (8332 passed), mostly
   12–15s timeouts under heavy host load. Not triaged. No tests are excluded.
 - `cap sync` / gradle — **not run** (no `android/`, no SDK).
 
-### Smoke: executed, PASSED (bounded baseline render-loop errors tolerated)
+### Smoke: executed, PASSED (bounded render-loop errors at the guard site tolerated)
 
 Scratch gateway (`hermes serve --port 19719` + `hermes gateway run`,
 throwaway `HERMES_HOME`, no model provider), production build on `vite
@@ -306,12 +302,26 @@ preview`, headless Chromium 155. The smoke:
   "unavailable";
 - runs the phone drawer open/close and overflow check.
 
+**Guard site, derived from the build.** Before launching the browser, the
+smoke scans the served build's JS assets (`--dist`, default `dist/`) for the
+`@assistant-ui/tap` `useSyncExternalStore` guard's throw expression:
+`Error(…)` or `new Error(…)` with the exact guard message. It requires
+**exactly one** occurrence and records its `file:line:column`, the position
+V8 reports for that frame. Node confirms V8 reports `Error(` at `Error` and
+`new Error(` at `new`.
+- In this build there is one: **`capabilities-B1fqOH3C.js:4:1991`**, the
+  `Error(` in `if(++o.current>50)throw o.current=0,Error(...)`. That is
+  exactly the top frame of every observed baseline error.
+- No source maps are emitted, so the site comes from the minified asset, not
+  from a source-mapped origin.
+- Zero or several candidates, or a different build being served, means **no
+  allowance**: every page error fails (fail closed).
+
 Page errors are judged by `scripts/smoke-classifier.mjs`. An error is
 tolerated only if **all** of these hold, and anything else fails the run:
-- the message is exactly the `@assistant-ui/tap` `useSyncExternalStore`
-  guard message;
-- the **top stack frame** is in the built `capabilities-*.js` chunk, where
-  every observed baseline occurrence originates;
+- the message is exactly the guard message;
+- the **top stack frame is exactly the guard site** (`file:line:column`), not
+  merely somewhere in the same chunk;
 - it happens in a connected phase (`tablet`/`phone`). **Onboarding gets no
   allowance.** The phase switches to `tablet` on the main-frame navigation
   that "Save and reconnect" triggers;
@@ -319,20 +329,32 @@ tolerated only if **all** of these hold, and anything else fails the run:
   per phase. Observed counts: 6–7 here, 8–9 in a reviewer's run, 5 in
   upstream Electron.
 
-**What this establishes, and what it doesn't.** The upstream Electron
-comparison shows the original loop is upstream behavior. The classifier
-establishes only that each tolerated error has that loop's **shape**: same
-generic message, same top frame inside tap's hook, connected surface, within
-the bound. Because the message and frame belong to tap's generic hook, a
-*new* loop through the same hook that stays within the bound would also pass.
-Errors from any other origin, during onboarding, or above the bound fail.
-Unit tests in `scripts/smoke-classifier.test.mjs` cover each of those cases,
-including an injected same-message error from an unrelated function. If the
-build renames the chunk, the smoke goes red rather than silently green.
+**What this establishes, and what it doesn't.**
+- The upstream Electron comparison shows the original loop is upstream
+  behavior.
+- The classifier establishes that each tolerated error was **thrown by tap's
+  `useSyncExternalStore` guard itself**, with that exact message, on the
+  connected surface, within the bound.
+- It does **not** identify which tap resource looped. The guard is shared by
+  every tap resource using that hook, so a *different* resource looping
+  through the same guard, within the bound, would also pass.
+- It rejects:
+  - the same message thrown from any other location, including other code
+    in the same `capabilities-*` chunk;
+  - errors whose top frame is elsewhere, even with the guard frame further
+    down the stack;
+  - onboarding errors and counts above the bound;
+  - everything when no unique guard site is found.
+
+  `scripts/smoke-classifier.test.mjs` covers each case. That includes the
+  reviewers' scenario: same message, same chunk, different function/location
+  (`capabilities-B1fqOH3C.js:32:127`, off-by-one columns, the right location
+  in a different file).
 
 Output, verbatim (token redacted):
 
 ```
+render-loop guard site: capabilities-B1fqOH3C.js:4:1991
 screenshot: /tmp/smoke-out/1-onboarding.png
 [tablet] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
 screenshot: /tmp/smoke-out/2-connected-1280.png
@@ -340,13 +362,31 @@ screenshot: /tmp/smoke-out/3-connected-tablet-820.png
 [phone] console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
 screenshot: /tmp/smoke-out/4-connected-phone-390.png
 screenshot: /tmp/smoke-out/5-phone-drawer-open.png
-[tablet] baseline-shaped render-loop pageerror ×6 (tolerated, bound 21): tap getSnapshot guard message, top frame in the capabilities-* chunk
-[phone] baseline-shaped render-loop pageerror ×6 (tolerated, bound 21): tap getSnapshot guard message, top frame in the capabilities-* chunk
+[tablet] baseline-shaped render-loop pageerror ×7 (tolerated, bound 21): guard message, top frame exactly at the guard site
+[phone] baseline-shaped render-loop pageerror ×7 (tolerated, bound 21): guard message, top frame exactly at the guard site
 SMOKE OK: onboarding → connected chat surface (tablet + phone), page errors limited to the bounded baseline render-loop shape, zero bridge errors
 exit=0
 ```
 
+**Fail-closed check, real browser.** The same smoke against the same server,
+with `--dist` pointed at an empty directory so no guard site can be found
+(excerpt, token redacted):
+
+```
+render-loop guard site: NOT identified in this build — no page error will be tolerated
+SMOKE FAILED:
+[tablet] pageerror: Maximum update depth exceeded. The result of getSnapshot should be cached to avoid an infinite loop. [no guard site identified in this build: no allowance]
+    at http://127.0.0.1:4174/assets/capabilities-B1fqOH3C.js:4:1991
+[tablet] pageerror: Maximum update depth exceeded. The result of getSnapshot should be cached to avoid an infinite loop. [no guard site identified in this build: no allowance]
+    at http://127.0.0.1:4174/assets/capabilities-B1fqOH3C.js:4:1991
+    … (12 errors, all rejected)
+exit=1
+```
+
 Earlier rounds (kept for history):
+- Round 6's classifier accepted a top frame anywhere in the ~534 KB
+  `capabilities-*.js` chunk. Reviewers showed that an unrelated same-message
+  throw elsewhere in that chunk passed; round 7 pins it to the guard site.
 - Round 5's smoke tolerated every page error with the exact message,
   unbounded. Reviewers showed that this passed injected unrelated errors;
   round 6 replaced it with the classifier above.
