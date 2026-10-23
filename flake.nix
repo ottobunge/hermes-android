@@ -17,7 +17,11 @@
         buildToolsVersions = [ "35.0.0" "36.0.0" ];
         platformVersions = [ "35" "36" ];
         includeNDK = false;
-        includeEmulator = false;
+        # Headless emulator for on-device smoke tests (KVM on heavengraph).
+        includeEmulator = true;
+        includeSystemImages = true;
+        systemImageTypes = [ "google_apis" ];
+        abiVersions = [ "x86_64" ];
       };
     in
     {
