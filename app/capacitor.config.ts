@@ -4,11 +4,14 @@ const config: CapacitorConfig = {
   appId: 'com.bunge.hermes',
   appName: 'Hermes',
   webDir: 'dist',
-  // Network policy is deliberately unset until the native project exists:
-  // HTTPS/WSS gateways are the supported path. Plain http:// on Android needs
-  // an explicit cleartext policy (server.cleartext / networkSecurityConfig),
-  // which `allowMixedContent` does NOT provide — decide it when android/ is
-  // generated (README "Deviations").
+  // Test-rig policy (debug builds only): allow plain-http/ws gateways on
+  // private addresses (emulator host loopback, LAN labs). HTTPS/WSS stays the
+  // supported production path; a release build must not ship this.
+  server: {
+    cleartext: true,
+    // http origin so ws:// gateway dials aren't mixed-content-blocked.
+    androidScheme: 'http',
+  },
 }
 
 export default config
